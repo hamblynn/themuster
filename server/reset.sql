@@ -1,0 +1,15 @@
+DROP TABLE IF EXISTS sightings;
+DROP TABLE IF EXISTS referrals;
+DROP TABLE IF EXISTS reviews;
+DROP TABLE IF EXISTS messages;
+DROP TABLE IF EXISTS harvest_declarations;
+DROP TABLE IF EXISTS bookings;
+DROP TABLE IF EXISTS credentials;
+DROP TABLE IF EXISTS hunters;
+DROP TABLE IF EXISTS no_go_zones;
+DROP TABLE IF EXISTS property_species;
+DROP TABLE IF EXISTS game_species;
+DROP TABLE IF EXISTS properties;
+DROP TABLE IF EXISTS farmers;
+DROP TABLE IF EXISTS admins;
+DROP TABLE IF EXISTS news;

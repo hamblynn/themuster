@@ -533,3 +533,5 @@ console.log(`Demo logins (password: ${DEMO_PASSWORD}):`);
 console.log(`  Farmer — nathan@example.com (plus 20 more, e.g. firstname.lastnameN@example.com)`);
 console.log(`  Hunter — tom@example.com / jess@example.com / dale@example.com (plus 20 more)`);
 console.log(`Admin login — username "admin", password "${ADMIN_PASSWORD}"`);
+
+db.close();

@@ -535,3 +535,9 @@ console.log(`  Hunter — tom@example.com / jess@example.com / dale@example.com 
 console.log(`Admin login — username "admin", password "${ADMIN_PASSWORD}"`);
 
 db.close();
+
+// Node's normal shutdown sequence runs a final GC/cleanup pass, which is
+// what triggered the RemoveEnvironmentCleanupHook crash on Render's Linux
+// runtime (better-sqlite3 Statement objects being finalized after the
+// environment starts tearing down). Exiting immediately skips that pass.
+process.exit(0);

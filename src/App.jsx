@@ -55,8 +55,10 @@ const fontDisplay = { fontFamily: "'Fraunces', ui-serif, Georgia, serif" };
 const fontBody = { fontFamily: "'IBM Plex Sans', ui-sans-serif, system-ui" };
 const fontMono = { fontFamily: "'IBM Plex Mono', ui-monospace, monospace" };
 
-// Node backend (see /server) — run `npm run seed && npm start` in that folder
-const API_BASE = "http://localhost:4000/api";
+// Node backend (see /server) — run `npm run seed && npm start` in that folder.
+// Locally this defaults to localhost; deployed, set VITE_API_BASE (e.g. in
+// Vercel's project env vars) to the deployed backend's URL, ending in /api.
+const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:4000/api";
 
 // ---------------------------------------------------------
 // AUTH CONTEXT

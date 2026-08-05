@@ -13,12 +13,19 @@ const TOKEN_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000;
 // session in the same browser.
 const COOKIE_NAME = "muster_token";
 const ADMIN_COOKIE_NAME = "muster_admin_token";
-const COOKIE_OPTS = {
+
+// Locally, frontend and backend share a scheme (http) and are treated
+// as same-site by the browser, so "lax" + non-secure works. Deployed,
+// they're typically on two different domains (e.g. a Vercel frontend
+// calling a Render backend) — that's a cross-site request, which
+// requires "none" + secure (the browser rejects "none" without secure).
+const IN_PRODUCTION = process.env.NODE_ENV === "production";
+const BASE_COOKIE_OPTS = {
   httpOnly: true,
-  sameSite: "lax",
-  secure: false, // dev over plain http — set true once this is served over https
-  maxAge: TOKEN_EXPIRY_MS,
+  sameSite: IN_PRODUCTION ? "none" : "lax",
+  secure: IN_PRODUCTION,
 };
+const COOKIE_OPTS = { ...BASE_COOKIE_OPTS, maxAge: TOKEN_EXPIRY_MS };
 
 function hashPassword(plain) {
   return bcrypt.hashSync(plain, 10);
@@ -45,13 +52,13 @@ function setSessionCookie(res, user) {
   res.cookie(COOKIE_NAME, signToken(user), COOKIE_OPTS);
 }
 function clearSessionCookie(res) {
-  res.clearCookie(COOKIE_NAME, { httpOnly: true, sameSite: "lax", secure: false });
+  res.clearCookie(COOKIE_NAME, BASE_COOKIE_OPTS);
 }
 function setAdminSessionCookie(res, admin) {
   res.cookie(ADMIN_COOKIE_NAME, signToken(admin), COOKIE_OPTS);
 }
 function clearAdminSessionCookie(res) {
-  res.clearCookie(ADMIN_COOKIE_NAME, { httpOnly: true, sameSite: "lax", secure: false });
+  res.clearCookie(ADMIN_COOKIE_NAME, BASE_COOKIE_OPTS);
 }
 
 // Express middleware: requires a valid session cookie, optionally of a

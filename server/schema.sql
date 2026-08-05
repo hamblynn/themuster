@@ -156,6 +156,11 @@ CREATE TABLE hunters (
   availability_days      TEXT,     -- comma-separated lowercase day abbreviations, 'weekly' mode only
   availability_interval  INTEGER,  -- e.g. 2 = every second day, 'interval' mode only
   availability_anchor_date TEXT,   -- a date known to be available, 'interval' mode only
+  -- Live-tracking SOS: who to call, and whether this hunter wants to be
+  -- alerted about *other* nearby hunters' SOS while they're out too.
+  emergency_contact_name  TEXT,
+  emergency_contact_phone TEXT,
+  sos_alert_opt_in        INTEGER NOT NULL DEFAULT 0,
   created_at          TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -287,6 +292,67 @@ CREATE TABLE sightings (
   created_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- ------------------------------------------------------------
+-- LIVE TRACKING & SOS
+-- A hunter's continuous GPS track during an approved booking visit
+-- (started_at/ended_at *is* the check-in/check-out record — the
+-- bookings.status machine itself is untouched). Private to the
+-- hunter by default; share_with_farmer is an explicit opt-in they
+-- can toggle mid-session. Only one active session per hunter at a
+-- time (see the partial unique index below) so an SOS's "nearby
+-- active hunters" lookup always has an unambiguous latest point.
+-- ------------------------------------------------------------
+CREATE TABLE tracking_sessions (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  booking_id        INTEGER NOT NULL REFERENCES bookings(id) ON DELETE CASCADE,
+  hunter_id         INTEGER NOT NULL REFERENCES hunters(id) ON DELETE CASCADE,
+  started_at        TEXT NOT NULL DEFAULT (datetime('now')),
+  ended_at          TEXT,                          -- NULL while active
+  share_with_farmer INTEGER NOT NULL DEFAULT 0,
+  created_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE track_points (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id  INTEGER NOT NULL REFERENCES tracking_sessions(id) ON DELETE CASCADE,
+  latitude    REAL NOT NULL,
+  longitude   REAL NOT NULL,
+  recorded_at TEXT NOT NULL DEFAULT (datetime('now'))  -- server-assigned; don't trust client clocks
+);
+
+CREATE TABLE track_tags (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id  INTEGER NOT NULL REFERENCES tracking_sessions(id) ON DELETE CASCADE,
+  tag_type    TEXT NOT NULL CHECK (tag_type IN ('shot', 'left', 'processed')),
+  latitude    REAL NOT NULL,
+  longitude   REAL NOT NULL,
+  notes       TEXT,
+  recorded_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE sos_alerts (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id       INTEGER NOT NULL REFERENCES tracking_sessions(id) ON DELETE CASCADE,
+  hunter_id        INTEGER NOT NULL REFERENCES hunters(id) ON DELETE CASCADE,
+  latitude         REAL NOT NULL,
+  longitude        REAL NOT NULL,
+  triggered_at     TEXT NOT NULL DEFAULT (datetime('now')),
+  resolved_at      TEXT,
+  resolved_by_role TEXT CHECK (resolved_by_role IN ('farmer', 'hunter', 'admin')),
+  resolved_by_id   INTEGER
+);
+
+-- A user (farmer or hunter) can have several subscriptions (multiple devices).
+CREATE TABLE push_subscriptions (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  owner_role TEXT NOT NULL CHECK (owner_role IN ('farmer', 'hunter')),
+  owner_id   INTEGER NOT NULL,
+  endpoint   TEXT NOT NULL UNIQUE,
+  p256dh     TEXT NOT NULL,
+  auth       TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- ============================================================
 -- INDEXES for the queries you'll run most often
 -- ============================================================
@@ -299,3 +365,10 @@ CREATE INDEX idx_bookings_property ON bookings(property_id);
 CREATE INDEX idx_bookings_hunter ON bookings(hunter_id);
 CREATE INDEX idx_bookings_status ON bookings(status);
 CREATE INDEX idx_sightings_property ON sightings(property_id);
+CREATE INDEX idx_tracking_sessions_booking ON tracking_sessions(booking_id);
+-- Enforces "one active session per hunter" AND serves as the lookup index for it.
+CREATE UNIQUE INDEX idx_one_active_session_per_hunter ON tracking_sessions(hunter_id) WHERE ended_at IS NULL;
+CREATE INDEX idx_track_points_session ON track_points(session_id);
+CREATE INDEX idx_track_tags_session ON track_tags(session_id);
+CREATE INDEX idx_sos_alerts_session ON sos_alerts(session_id);
+CREATE INDEX idx_push_subscriptions_owner ON push_subscriptions(owner_role, owner_id);

@@ -1,3 +1,8 @@
+DROP TABLE IF EXISTS push_subscriptions;
+DROP TABLE IF EXISTS sos_alerts;
+DROP TABLE IF EXISTS track_tags;
+DROP TABLE IF EXISTS track_points;
+DROP TABLE IF EXISTS tracking_sessions;
 DROP TABLE IF EXISTS sightings;
 DROP TABLE IF EXISTS referrals;
 DROP TABLE IF EXISTS reviews;

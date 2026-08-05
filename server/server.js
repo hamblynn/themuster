@@ -4,10 +4,22 @@ const cookieParser = require("cookie-parser");
 const Database = require("better-sqlite3");
 const path = require("path");
 const fs = require("fs");
+const webPush = require("web-push");
 const {
   hashPassword, verifyPassword, requireAuth, requireAdminAuth,
   setSessionCookie, clearSessionCookie, setAdminSessionCookie, clearAdminSessionCookie,
 } = require("./auth");
+
+// VAPID identifies this app to push services (not a secret in the same
+// sense as JWT_SECRET — the public key is meant to be public, and it's
+// fine to reuse the same pair across dev/prod). Falls back to a
+// generated pair for local dev convenience; set real env vars on the
+// host to override if you want your own.
+webPush.setVapidDetails(
+  process.env.VAPID_SUBJECT || "mailto:admin@example.com",
+  process.env.VAPID_PUBLIC_KEY || "BCBd5HYiBZJjCBdFLjQm11ceAagJ8Kj3SwfQyFsElJ5KIO2TfCpRFIJ6uXenRDsp6l8Rf07oipABXYFHE5Vty-I",
+  process.env.VAPID_PRIVATE_KEY || "mWhwd2hZRRqHqb8tKIc2_FLzbpevBy9mXfcSSUyee-U"
+);
 
 const dbPath = path.join(__dirname, "muster.db");
 if (!fs.existsSync(dbPath)) {
@@ -16,6 +28,11 @@ if (!fs.existsSync(dbPath)) {
 }
 const db = new Database(dbPath);
 db.pragma("foreign_keys = ON");
+// Live-tracking mixes concurrent writes (GPS points streaming in) with
+// concurrent reads (a farmer polling a shared track) for the first time —
+// the default rollback-journal mode serializes readers behind writers and
+// can throw "database is locked" under that combination.
+db.pragma("journal_mode = WAL");
 
 const app = express();
 // credentials: true + an explicit origin (not "*") are both required for
@@ -39,6 +56,30 @@ function distanceKm(lat1, lon1, lat2, lon2) {
       Math.cos((lat2 * Math.PI) / 180) *
       Math.sin(dLon / 2) ** 2;
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+// Sends a Web Push notification to one subscription. Keeps the payload
+// small (4KB limit, encrypted) — the client deep-links into the app to
+// fetch full detail rather than the push payload carrying everything.
+// Prunes the subscription on 404/410 (permanently-gone endpoint) rather
+// than leaving dead rows around.
+async function sendPush(subscriptionRow, payload) {
+  const subscription = {
+    endpoint: subscriptionRow.endpoint,
+    keys: { p256dh: subscriptionRow.p256dh, auth: subscriptionRow.auth },
+  };
+  try {
+    await webPush.sendNotification(subscription, JSON.stringify(payload), {
+      TTL: 3600,
+      urgency: "high",
+    });
+  } catch (e) {
+    if (e.statusCode === 404 || e.statusCode === 410) {
+      db.prepare(`DELETE FROM push_subscriptions WHERE endpoint = ?`).run(subscriptionRow.endpoint);
+    } else {
+      console.error("Push send failed:", e.statusCode, e.body || e.message);
+    }
+  }
 }
 
 const DAY_ABBREVS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"]; // matches Date#getUTCDay() index
@@ -265,6 +306,7 @@ const SELF_EDITABLE_FIELDS_BY_ROLE = {
   hunter: [
     "name", "email", "phone", "bio", "latitude", "longitude", "thermal_capable", "suppressed_capable",
     "availability_mode", "availability_days", "availability_interval", "availability_anchor_date",
+    "emergency_contact_name", "emergency_contact_phone", "sos_alert_opt_in",
   ],
 };
 app.patch("/api/me", requireAuth(), (req, res) => {
@@ -273,7 +315,7 @@ app.patch("/api/me", requireAuth(), (req, res) => {
   const updates = {};
   editable.forEach((field) => {
     if (req.body[field] === undefined) return;
-    if (field === "thermal_capable" || field === "suppressed_capable") {
+    if (field === "thermal_capable" || field === "suppressed_capable" || field === "sos_alert_opt_in") {
       updates[field] = req.body[field] ? 1 : 0;
     } else {
       updates[field] = req.body[field];
@@ -974,7 +1016,14 @@ app.get("/api/bookings", requireAuth(), (req, res) => {
           .all(req.user.id);
 
   const declStmt = db.prepare(`SELECT * FROM harvest_declarations WHERE booking_id = ? ORDER BY created_at DESC`);
-  res.json(rows.map((b) => ({ ...b, harvest_declarations: declStmt.all(b.id) })));
+  const trackingStmt = db.prepare(`SELECT * FROM tracking_sessions WHERE booking_id = ? ORDER BY started_at DESC LIMIT 1`);
+  res.json(
+    rows.map((b) => ({
+      ...b,
+      harvest_declarations: declStmt.all(b.id),
+      tracking_session: trackingStmt.get(b.id) || null,
+    }))
+  );
 });
 
 // GET /api/bookings/:id — booking + pre-filled declaration data
@@ -1282,6 +1331,307 @@ app.get("/api/properties/:id/parcel", requireAuth("farmer"), async (req, res) =>
   } catch (e) {
     res.status(502).json({ error: `Could not reach VicPlan: ${e.message}` });
   }
+});
+
+// ===========================================================
+// LIVE TRACKING & SOS
+// A hunter's GPS track during an approved booking visit. Session
+// start/stop *is* the check-in/check-out record — bookings.status is
+// untouched. Private to the hunter by default (share_with_farmer),
+// except an unresolved SOS always grants the property's farmer access
+// so they can actually help.
+// ===========================================================
+
+const TRACK_TAG_TYPES = ["shot", "left", "processed"];
+const SOS_ALERT_RADIUS_KM = 20;
+
+// POST /api/bookings/:id/tracking/start — hunter only, must be their
+// own approved booking. The partial unique index on tracking_sessions
+// enforces one active session per hunter at a time.
+app.post("/api/bookings/:id/tracking/start", requireAuth("hunter"), (req, res) => {
+  const booking = db.prepare(`SELECT * FROM bookings WHERE id = ?`).get(req.params.id);
+  if (!booking) return res.status(404).json({ error: "Booking not found" });
+  if (booking.hunter_id !== req.user.id) {
+    return res.status(403).json({ error: "You can only track your own bookings" });
+  }
+  if (booking.status !== "approved") {
+    return res.status(400).json({ error: "Tracking can only be started on an approved booking" });
+  }
+  try {
+    const result = db
+      .prepare(`INSERT INTO tracking_sessions (booking_id, hunter_id) VALUES (?, ?)`)
+      .run(booking.id, req.user.id);
+    res.status(201).json(db.prepare(`SELECT * FROM tracking_sessions WHERE id = ?`).get(result.lastInsertRowid));
+  } catch (e) {
+    if (e.message.includes("UNIQUE")) {
+      return res.status(400).json({ error: "You already have an active tracking session" });
+    }
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// PATCH /api/tracking/:sessionId — owner hunter only. body: { stop: true }
+// to end the session (server sets ended_at, never trusts a client value),
+// and/or { share_with_farmer: bool }.
+app.patch("/api/tracking/:sessionId", requireAuth("hunter"), (req, res) => {
+  const session = db.prepare(`SELECT * FROM tracking_sessions WHERE id = ?`).get(req.params.sessionId);
+  if (!session) return res.status(404).json({ error: "Tracking session not found" });
+  if (session.hunter_id !== req.user.id) {
+    return res.status(403).json({ error: "You can only edit your own tracking session" });
+  }
+  if (session.ended_at) {
+    return res.status(400).json({ error: "This tracking session has already ended" });
+  }
+  if (req.body.stop) {
+    db.prepare(`UPDATE tracking_sessions SET ended_at = datetime('now') WHERE id = ?`).run(session.id);
+  }
+  if (req.body.share_with_farmer !== undefined) {
+    db.prepare(`UPDATE tracking_sessions SET share_with_farmer = ? WHERE id = ?`).run(
+      req.body.share_with_farmer ? 1 : 0,
+      session.id
+    );
+  }
+  res.json(db.prepare(`SELECT * FROM tracking_sessions WHERE id = ?`).get(session.id));
+});
+
+// POST /api/tracking/:sessionId/points — owner hunter only, only while
+// active. body: { points: [{latitude, longitude}, ...] } — the client
+// batches a few points per request to cut request volume.
+app.post("/api/tracking/:sessionId/points", requireAuth("hunter"), (req, res) => {
+  const session = db.prepare(`SELECT * FROM tracking_sessions WHERE id = ?`).get(req.params.sessionId);
+  if (!session) return res.status(404).json({ error: "Tracking session not found" });
+  if (session.hunter_id !== req.user.id) {
+    return res.status(403).json({ error: "You can only add points to your own tracking session" });
+  }
+  if (session.ended_at) {
+    return res.status(400).json({ error: "This tracking session has ended" });
+  }
+  const points = Array.isArray(req.body.points) ? req.body.points : [];
+  const valid = points.filter((p) => typeof p?.latitude === "number" && typeof p?.longitude === "number");
+  if (valid.length === 0) {
+    return res.status(400).json({ error: "points must include at least one {latitude, longitude}" });
+  }
+  const insertPoint = db.prepare(`INSERT INTO track_points (session_id, latitude, longitude) VALUES (?, ?, ?)`);
+  db.transaction((rows) => rows.forEach((p) => insertPoint.run(session.id, p.latitude, p.longitude)))(valid);
+  res.status(201).json({ ok: true, inserted: valid.length });
+});
+
+// POST /api/tracking/:sessionId/tags — owner hunter only.
+app.post("/api/tracking/:sessionId/tags", requireAuth("hunter"), (req, res) => {
+  const session = db.prepare(`SELECT * FROM tracking_sessions WHERE id = ?`).get(req.params.sessionId);
+  if (!session) return res.status(404).json({ error: "Tracking session not found" });
+  if (session.hunter_id !== req.user.id) {
+    return res.status(403).json({ error: "You can only tag your own tracking session" });
+  }
+  const { tag_type, latitude, longitude, notes } = req.body;
+  if (!TRACK_TAG_TYPES.includes(tag_type) || typeof latitude !== "number" || typeof longitude !== "number") {
+    return res.status(400).json({
+      error: `tag_type must be one of ${TRACK_TAG_TYPES.join(", ")}, plus latitude/longitude`,
+    });
+  }
+  const result = db
+    .prepare(`INSERT INTO track_tags (session_id, tag_type, latitude, longitude, notes) VALUES (?, ?, ?, ?, ?)`)
+    .run(session.id, tag_type, latitude, longitude, notes || null);
+  res.status(201).json(db.prepare(`SELECT * FROM track_tags WHERE id = ?`).get(result.lastInsertRowid));
+});
+
+// GET /api/tracking/:sessionId — owner hunter, or the farmer who owns
+// the booking's property AND (share_with_farmer=1 OR there's an
+// unresolved SOS — safety overrides the privacy default).
+app.get("/api/tracking/:sessionId", requireAuth(), (req, res) => {
+  const session = db.prepare(`SELECT * FROM tracking_sessions WHERE id = ?`).get(req.params.sessionId);
+  if (!session) return res.status(404).json({ error: "Tracking session not found" });
+
+  const isOwnerHunter = req.user.role === "hunter" && session.hunter_id === req.user.id;
+  let isFarmerAllowed = false;
+  if (req.user.role === "farmer") {
+    const booking = db.prepare(`SELECT * FROM bookings WHERE id = ?`).get(session.booking_id);
+    const property = booking && db.prepare(`SELECT farmer_id FROM properties WHERE id = ?`).get(booking.property_id);
+    const ownsProperty = property?.farmer_id === req.user.id;
+    const hasUnresolvedSos = !!db
+      .prepare(`SELECT id FROM sos_alerts WHERE session_id = ? AND resolved_at IS NULL LIMIT 1`)
+      .get(session.id);
+    isFarmerAllowed = ownsProperty && (!!session.share_with_farmer || hasUnresolvedSos);
+  }
+  if (!isOwnerHunter && !isFarmerAllowed) {
+    return res.status(403).json({ error: "You don't have access to this tracking session" });
+  }
+
+  session.points = db.prepare(`SELECT * FROM track_points WHERE session_id = ? ORDER BY recorded_at`).all(session.id);
+  session.tags = db.prepare(`SELECT * FROM track_tags WHERE session_id = ? ORDER BY recorded_at`).all(session.id);
+  res.json(session);
+});
+
+// POST /api/tracking/:sessionId/sos — owner hunter only. Pushes to the
+// property's farmer, plus any other hunters currently out (active
+// session) who've opted in to nearby-SOS alerts and are within radius
+// of their own most recent point.
+app.post("/api/tracking/:sessionId/sos", requireAuth("hunter"), (req, res) => {
+  const session = db.prepare(`SELECT * FROM tracking_sessions WHERE id = ?`).get(req.params.sessionId);
+  if (!session) return res.status(404).json({ error: "Tracking session not found" });
+  if (session.hunter_id !== req.user.id) {
+    return res.status(403).json({ error: "You can only trigger SOS on your own tracking session" });
+  }
+  const { latitude, longitude } = req.body;
+  if (typeof latitude !== "number" || typeof longitude !== "number") {
+    return res.status(400).json({ error: "latitude and longitude are required" });
+  }
+
+  const result = db
+    .prepare(`INSERT INTO sos_alerts (session_id, hunter_id, latitude, longitude) VALUES (?, ?, ?, ?)`)
+    .run(session.id, req.user.id, latitude, longitude);
+  const alert = db.prepare(`SELECT * FROM sos_alerts WHERE id = ?`).get(result.lastInsertRowid);
+
+  const hunter = db.prepare(`SELECT name FROM hunters WHERE id = ?`).get(req.user.id);
+  const booking = db.prepare(`SELECT * FROM bookings WHERE id = ?`).get(session.booking_id);
+  const property = db.prepare(`SELECT * FROM properties WHERE id = ?`).get(booking.property_id);
+
+  const payload = { type: "sos", session_id: session.id, sos_id: alert.id, hunter_name: hunter.name, lat: latitude, lng: longitude };
+
+  db.prepare(`SELECT * FROM push_subscriptions WHERE owner_role = 'farmer' AND owner_id = ?`)
+    .all(property.farmer_id)
+    .forEach((sub) => sendPush(sub, payload));
+
+  const activeHunterLatestPoints = db
+    .prepare(`
+      SELECT * FROM (
+        SELECT tp.*, ts.hunter_id, ts.id AS session_id,
+               ROW_NUMBER() OVER (PARTITION BY tp.session_id ORDER BY tp.recorded_at DESC) AS rn
+        FROM track_points tp JOIN tracking_sessions ts ON ts.id = tp.session_id
+        WHERE ts.ended_at IS NULL AND ts.hunter_id != ?
+      ) WHERE rn = 1
+    `)
+    .all(req.user.id);
+
+  activeHunterLatestPoints
+    .filter((p) => {
+      const h = db.prepare(`SELECT sos_alert_opt_in FROM hunters WHERE id = ?`).get(p.hunter_id);
+      return h?.sos_alert_opt_in && distanceKm(latitude, longitude, p.latitude, p.longitude) <= SOS_ALERT_RADIUS_KM;
+    })
+    .forEach((p) => {
+      db.prepare(`SELECT * FROM push_subscriptions WHERE owner_role = 'hunter' AND owner_id = ?`)
+        .all(p.hunter_id)
+        .forEach((sub) => sendPush(sub, payload));
+    });
+
+  res.status(201).json(alert);
+});
+
+// PATCH /api/sos/:id — owner hunter (false alarm, resolved themselves)
+// or the farmer on that property.
+app.patch("/api/sos/:id", requireAuth(), (req, res) => {
+  const alert = db.prepare(`SELECT * FROM sos_alerts WHERE id = ?`).get(req.params.id);
+  if (!alert) return res.status(404).json({ error: "SOS alert not found" });
+
+  const isOwnerHunter = req.user.role === "hunter" && alert.hunter_id === req.user.id;
+  let isPropertyFarmer = false;
+  if (req.user.role === "farmer") {
+    const session = db.prepare(`SELECT * FROM tracking_sessions WHERE id = ?`).get(alert.session_id);
+    const booking = session && db.prepare(`SELECT * FROM bookings WHERE id = ?`).get(session.booking_id);
+    const property = booking && db.prepare(`SELECT farmer_id FROM properties WHERE id = ?`).get(booking.property_id);
+    isPropertyFarmer = property?.farmer_id === req.user.id;
+  }
+  if (!isOwnerHunter && !isPropertyFarmer) {
+    return res.status(403).json({ error: "You don't have access to this SOS alert" });
+  }
+
+  db.prepare(`UPDATE sos_alerts SET resolved_at = datetime('now'), resolved_by_role = ?, resolved_by_id = ? WHERE id = ?`)
+    .run(req.user.role, req.user.id, alert.id);
+  res.json(db.prepare(`SELECT * FROM sos_alerts WHERE id = ?`).get(alert.id));
+});
+
+// GET /api/sos/active — in-app fallback since push delivery isn't
+// guaranteed. Farmers see unresolved SOS on their properties' bookings;
+// hunters see their own, plus (if opted in) any within radius of their
+// own active session's latest point.
+app.get("/api/sos/active", requireAuth(), (req, res) => {
+  if (req.user.role === "farmer") {
+    return res.json(
+      db.prepare(`
+        SELECT sa.*, h.name AS hunter_name, h.emergency_contact_name, h.emergency_contact_phone,
+               p.name AS property_name
+        FROM sos_alerts sa
+        JOIN tracking_sessions ts ON ts.id = sa.session_id
+        JOIN bookings b ON b.id = ts.booking_id
+        JOIN properties p ON p.id = b.property_id
+        JOIN hunters h ON h.id = sa.hunter_id
+        WHERE sa.resolved_at IS NULL AND p.farmer_id = ?
+        ORDER BY sa.triggered_at DESC
+      `).all(req.user.id)
+    );
+  }
+
+  const own = db
+    .prepare(`SELECT sa.*, h.name AS hunter_name FROM sos_alerts sa JOIN hunters h ON h.id = sa.hunter_id WHERE sa.resolved_at IS NULL AND sa.hunter_id = ?`)
+    .all(req.user.id);
+
+  const me = db.prepare(`SELECT sos_alert_opt_in FROM hunters WHERE id = ?`).get(req.user.id);
+  let nearby = [];
+  if (me?.sos_alert_opt_in) {
+    const myLatestPoint = db
+      .prepare(`
+        SELECT tp.* FROM track_points tp JOIN tracking_sessions ts ON ts.id = tp.session_id
+        WHERE ts.hunter_id = ? AND ts.ended_at IS NULL ORDER BY tp.recorded_at DESC LIMIT 1
+      `)
+      .get(req.user.id);
+    if (myLatestPoint) {
+      nearby = db
+        .prepare(`SELECT sa.*, h.name AS hunter_name FROM sos_alerts sa JOIN hunters h ON h.id = sa.hunter_id WHERE sa.resolved_at IS NULL AND sa.hunter_id != ?`)
+        .all(req.user.id)
+        .filter((sa) => distanceKm(sa.latitude, sa.longitude, myLatestPoint.latitude, myLatestPoint.longitude) <= SOS_ALERT_RADIUS_KM);
+    }
+  }
+  res.json([...own, ...nearby]);
+});
+
+// ===========================================================
+// PUSH SUBSCRIPTIONS
+// Web Push (not a third-party service — VAPID keys only) backing the
+// hunter live-tracking SOS alert. A farmer or hunter can have several
+// subscriptions (one per device).
+// ===========================================================
+
+// GET /api/push/vapid-public-key — any authed user, needed client-side
+// for pushManager.subscribe({ applicationServerKey: ... })
+app.get("/api/push/vapid-public-key", requireAuth(), (req, res) => {
+  res.json({
+    publicKey:
+      process.env.VAPID_PUBLIC_KEY ||
+      "BCBd5HYiBZJjCBdFLjQm11ceAagJ8Kj3SwfQyFsElJ5KIO2TfCpRFIJ6uXenRDsp6l8Rf07oipABXYFHE5Vty-I",
+  });
+});
+
+// POST /api/push/subscribe — body: { endpoint, keys: { p256dh, auth } }
+// Upsert, not a plain insert — a device can legitimately resubscribe
+// with the same endpoint but rotated keys (see pushsubscriptionchange
+// handling in src/sw.js).
+app.post("/api/push/subscribe", requireAuth(), (req, res) => {
+  const { endpoint, keys } = req.body;
+  if (!endpoint || !keys?.p256dh || !keys?.auth) {
+    return res.status(400).json({ error: "endpoint and keys.p256dh/keys.auth are required" });
+  }
+  db.prepare(`
+    INSERT INTO push_subscriptions (owner_role, owner_id, endpoint, p256dh, auth)
+    VALUES (@owner_role, @owner_id, @endpoint, @p256dh, @auth)
+    ON CONFLICT(endpoint) DO UPDATE SET
+      p256dh = excluded.p256dh, auth = excluded.auth,
+      owner_role = excluded.owner_role, owner_id = excluded.owner_id
+  `).run({
+    owner_role: req.user.role,
+    owner_id: req.user.id,
+    endpoint,
+    p256dh: keys.p256dh,
+    auth: keys.auth,
+  });
+  res.status(201).json({ ok: true });
+});
+
+// POST /api/push/unsubscribe — body: { endpoint }
+app.post("/api/push/unsubscribe", requireAuth(), (req, res) => {
+  db.prepare(`DELETE FROM push_subscriptions WHERE endpoint = ? AND owner_role = ? AND owner_id = ?`).run(
+    req.body.endpoint, req.user.role, req.user.id
+  );
+  res.json({ ok: true });
 });
 
 // Most hosts (Render included) assign the port via PORT and expect the

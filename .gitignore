@@ -10,6 +10,7 @@ lerna-debug.log*
 node_modules
 dist
 dist-ssr
+dev-dist
 *.local
 
 # Editor directories and files
@@ -29,6 +30,8 @@ dist-ssr
 !.env.example
 *.db
 *.db-journal
+*.db-shm
+*.db-wal
 
 # Claude Code local session state (like .vscode/settings.json, personal not project config)
 .claude/settings.local.json

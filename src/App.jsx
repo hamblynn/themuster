@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import { useRegisterSW } from "virtual:pwa-register/react";
 import {
   MapPin,
   ShieldCheck,
@@ -30,7 +31,24 @@ import {
   X,
   Newspaper,
   Trash2,
+  RefreshCw,
+  Navigation,
+  Siren,
+  Crosshair,
 } from "lucide-react";
+import { MapContainer, TileLayer, Marker, Polyline, useMap } from "react-leaflet";
+import L from "leaflet";
+import "leaflet/dist/leaflet.css";
+
+// Leaflet's default marker icon breaks under Vite/Rollup bundling unless
+// explicitly re-pointed at the bundled image URLs — a well-known gotcha,
+// not a Muster-specific bug.
+delete L.Icon.Default.prototype._getIconUrl;
+L.Icon.Default.mergeOptions({
+  iconRetinaUrl: new URL("leaflet/dist/images/marker-icon-2x.png", import.meta.url).href,
+  iconUrl: new URL("leaflet/dist/images/marker-icon.png", import.meta.url).href,
+  shadowUrl: new URL("leaflet/dist/images/marker-shadow.png", import.meta.url).href,
+});
 
 /* ---------------------------------------------------------
    TOKENS
@@ -1044,6 +1062,7 @@ function FarmerDashboard({ goRefer, goProfile, goListProperty, goEditProperty })
 
   return (
     <div>
+      <EnableAlertsBanner />
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end" }}>
         <div>
           <div style={{ ...fontMono, fontSize: 11, color: C.steel, letterSpacing: 0.5, marginBottom: 4 }}>
@@ -2057,7 +2076,7 @@ function BookingCalendar({ bookings, getLabel }) {
    past bookings. The other side of BookingRequest: a farmer
    sends a request, this is where the hunter responds to it.
 --------------------------------------------------------- */
-function HunterBookings({ goMessages }) {
+function HunterBookings({ goMessages, goLiveTracker }) {
   const { user } = useAuth();
   const [bookings, setBookings] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -2259,6 +2278,11 @@ function HunterBookings({ goMessages }) {
                       {actingId === b.id ? "…" : "Mark completed"}
                     </GhostButton>
                   )}
+                  {b.status === "approved" && (
+                    <GhostButton icon={MapPin} onClick={() => goLiveTracker(b)}>
+                      {b.tracking_session && !b.tracking_session.ended_at ? "Continue tracking" : "Start tracking"}
+                    </GhostButton>
+                  )}
                 </div>
 
                 {(b.status === "approved" || b.status === "completed") && (
@@ -2268,6 +2292,455 @@ function HunterBookings({ goMessages }) {
             ))}
           </div>
         </div>
+      )}
+    </div>
+  );
+}
+
+function tagDivIcon(tagType) {
+  const color = { shot: C.rust, left: C.gold, processed: C.eucalyptDeep }[tagType] || C.steel;
+  const letter = { shot: "S", left: "L", processed: "P" }[tagType] || "?";
+  return L.divIcon({
+    className: "",
+    html: `<div style="width:20px;height:20px;border-radius:50%;background:${color};color:#fff;display:flex;align-items:center;justify-content:center;font-family:monospace;font-size:10px;font-weight:700;border:2px solid #fff;box-shadow:0 1px 3px rgba(0,0,0,0.4);">${letter}</div>`,
+    iconSize: [20, 20],
+    iconAnchor: [10, 10],
+  });
+}
+
+// Centers the map once, the first time a GPS fix arrives — doesn't fight
+// the hunter if they pan around afterward to look at where they've been.
+function RecenterOnce({ position }) {
+  const map = useMap();
+  const centeredRef = React.useRef(false);
+  React.useEffect(() => {
+    if (position && !centeredRef.current) {
+      map.setView(position, 16);
+      centeredRef.current = true;
+    }
+  }, [position, map]);
+  return null;
+}
+
+const TRACK_TAG_TYPES = [
+  { value: "shot", label: "Shot" },
+  { value: "left", label: "Left" },
+  { value: "processed", label: "Processed" },
+];
+const SOS_HOLD_MS = 2000;
+
+/* ---------------------------------------------------------
+   SCREEN — LIVE TRACKER
+   A hunter's continuous GPS track for a booking visit — private by
+   default, tags along the way, a hunter-controlled opt-in to share
+   with the farmer, and a hold-to-activate SOS. Reached from an
+   approved booking in HunterBookings; session start/stop is the
+   check-in/check-out record.
+--------------------------------------------------------- */
+function LiveTracker({ booking, goBack }) {
+  const activeFromBooking =
+    booking?.tracking_session && !booking.tracking_session.ended_at ? booking.tracking_session : null;
+
+  const [session, setSession] = useState(activeFromBooking);
+  const [points, setPoints] = useState([]); // [[lat,lng], ...]
+  const [tags, setTags] = useState([]);
+  const [currentPos, setCurrentPos] = useState(null);
+  const [starting, setStarting] = useState(false);
+  const [error, setError] = useState(null);
+  const [noteDraft, setNoteDraft] = useState("");
+  const [sosProgress, setSosProgress] = useState(0);
+  const [sosSent, setSosSent] = useState(false);
+
+  const watchIdRef = React.useRef(null);
+  const pendingPointsRef = React.useRef([]);
+  const flushTimerRef = React.useRef(null);
+  const wakeLockRef = React.useRef(null);
+  const sosTimerRef = React.useRef(null);
+  const sosIntervalRef = React.useRef(null);
+
+  // Resuming an already-active session (e.g. the page reloaded mid-hunt)
+  // — hydrate the existing points/tags instead of starting from empty.
+  React.useEffect(() => {
+    if (!activeFromBooking) return;
+    apiFetch(`/tracking/${activeFromBooking.id}`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((full) => {
+        if (!full) return;
+        setPoints((full.points || []).map((p) => [p.latitude, p.longitude]));
+        setTags(full.tags || []);
+      })
+      .catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function startTracking() {
+    setStarting(true);
+    setError(null);
+    apiFetch(`/bookings/${booking.id}/tracking/start`, { method: "POST" })
+      .then((r) => {
+        if (!r.ok) return r.json().then((e) => Promise.reject(new Error(e.error)));
+        return r.json();
+      })
+      .then(setSession)
+      .catch((e) => setError(e.message))
+      .finally(() => setStarting(false));
+  }
+
+  function flushPendingPoints() {
+    if (!session || pendingPointsRef.current.length === 0) return;
+    const batch = pendingPointsRef.current;
+    pendingPointsRef.current = [];
+    apiFetch(`/tracking/${session.id}/points`, { method: "POST", body: { points: batch } }).catch(() => {});
+  }
+
+  // GPS watch + periodic flush + screen wake lock, active only while a
+  // session exists and hasn't ended.
+  React.useEffect(() => {
+    if (!session || session.ended_at) return;
+    if (!navigator.geolocation) {
+      setError("Geolocation isn't available on this device or browser.");
+      return;
+    }
+
+    watchIdRef.current = navigator.geolocation.watchPosition(
+      (pos) => {
+        const next = [pos.coords.latitude, pos.coords.longitude];
+        setCurrentPos(next);
+        setPoints((prev) => [...prev, next]);
+        pendingPointsRef.current.push({ latitude: next[0], longitude: next[1] });
+      },
+      (err) => setError(`GPS error: ${err.message}`),
+      { enableHighAccuracy: true, maximumAge: 5000 }
+    );
+
+    flushTimerRef.current = setInterval(flushPendingPoints, 15000);
+
+    if ("wakeLock" in navigator) {
+      navigator.wakeLock
+        .request("screen")
+        .then((wl) => {
+          wakeLockRef.current = wl;
+        })
+        .catch(() => {});
+    }
+
+    return () => {
+      if (watchIdRef.current != null) navigator.geolocation.clearWatch(watchIdRef.current);
+      if (flushTimerRef.current) clearInterval(flushTimerRef.current);
+      if (wakeLockRef.current) wakeLockRef.current.release().catch(() => {});
+      wakeLockRef.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session?.id, session?.ended_at]);
+
+  function toggleShare(next) {
+    apiFetch(`/tracking/${session.id}`, { method: "PATCH", body: { share_with_farmer: next } })
+      .then((r) => r.json())
+      .then(setSession)
+      .catch(() => {});
+  }
+
+  function addTag(tagType) {
+    if (!currentPos) {
+      setError("Waiting for a GPS fix before you can add a tag.");
+      return;
+    }
+    apiFetch(`/tracking/${session.id}/tags`, {
+      method: "POST",
+      body: { tag_type: tagType, latitude: currentPos[0], longitude: currentPos[1], notes: noteDraft || null },
+    })
+      .then((r) => {
+        if (!r.ok) return r.json().then((e) => Promise.reject(new Error(e.error)));
+        return r.json();
+      })
+      .then((tag) => {
+        setTags((prev) => [...prev, tag]);
+        setNoteDraft("");
+        setError(null);
+      })
+      .catch((e) => setError(e.message));
+  }
+
+  function stopTracking() {
+    flushPendingPoints();
+    apiFetch(`/tracking/${session.id}`, { method: "PATCH", body: { stop: true } })
+      .then((r) => r.json())
+      .then(setSession)
+      .catch(() => {});
+  }
+
+  function triggerSos() {
+    if (!currentPos || !session) return;
+    apiFetch(`/tracking/${session.id}/sos`, {
+      method: "POST",
+      body: { latitude: currentPos[0], longitude: currentPos[1] },
+    })
+      .then((r) => (r.ok ? r.json() : Promise.reject()))
+      .then(() => setSosSent(true))
+      .catch(() => setError("Could not send SOS — check your connection and try again."));
+  }
+
+  function cancelSosHold() {
+    setSosProgress(0);
+    if (sosTimerRef.current) clearTimeout(sosTimerRef.current);
+    if (sosIntervalRef.current) clearInterval(sosIntervalRef.current);
+  }
+  function startSosHold() {
+    setSosSent(false);
+    const startedAt = Date.now();
+    sosIntervalRef.current = setInterval(() => {
+      setSosProgress(Math.min(1, (Date.now() - startedAt) / SOS_HOLD_MS));
+    }, 50);
+    sosTimerRef.current = setTimeout(() => {
+      cancelSosHold();
+      triggerSos();
+    }, SOS_HOLD_MS);
+  }
+
+  React.useEffect(() => cancelSosHold, []); // clear any pending timers on unmount
+
+  if (!booking) {
+    return <div style={{ ...fontBody, fontSize: 13, color: C.steel }}>No booking selected.</div>;
+  }
+
+  return (
+    <div>
+      <button
+        onClick={goBack}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 4,
+          background: "none",
+          border: "none",
+          padding: 0,
+          marginBottom: 12,
+          ...fontMono,
+          fontSize: 10.5,
+          color: C.steel,
+          cursor: "pointer",
+        }}
+      >
+        <ChevronLeft size={12} /> BACK
+      </button>
+
+      <div style={{ ...fontDisplay, fontSize: 20, color: C.charcoal }}>{booking.property_name}</div>
+      <div style={{ ...fontBody, fontSize: 12.5, color: C.steel, marginTop: 2, marginBottom: 12 }}>
+        Live tracker — private to you by default. Useful as a reference in the dark, whether or not you
+        choose to share it.
+      </div>
+
+      {error && <div style={{ ...fontBody, fontSize: 12.5, color: C.rust, marginBottom: 10 }}>{error}</div>}
+
+      {!session && (
+        <div style={{ textAlign: "center", padding: "24px 0" }}>
+          <PrimaryButton icon={Navigation} onClick={startTracking}>
+            {starting ? "Starting…" : "Start tracking"}
+          </PrimaryButton>
+        </div>
+      )}
+
+      {session && (
+        <>
+          <div style={{ borderRadius: 12, overflow: "hidden", border: `1px solid ${C.line}`, marginBottom: 12 }}>
+            <MapContainer
+              center={currentPos || [-37.05, 146.09]}
+              zoom={currentPos ? 16 : 8}
+              style={{ height: 320, width: "100%" }}
+            >
+              <TileLayer
+                attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+                url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+              />
+              <RecenterOnce position={currentPos} />
+              {points.length > 1 && (
+                <Polyline positions={points} pathOptions={{ color: C.eucalyptDeep, weight: 3 }} />
+              )}
+              {currentPos && <Marker position={currentPos} />}
+              {tags.map((t) => (
+                <Marker key={t.id} position={[t.latitude, t.longitude]} icon={tagDivIcon(t.tag_type)} />
+              ))}
+            </MapContainer>
+          </div>
+
+          {!session.ended_at && (
+            <>
+              <div style={{ marginBottom: 12 }}>
+                <Checkbox
+                  label="Share live location with farmer"
+                  checked={!!session.share_with_farmer}
+                  onChange={toggleShare}
+                />
+              </div>
+
+              <SectionLabel>Tag this spot</SectionLabel>
+              <TextField
+                label="NOTE (OPTIONAL)"
+                value={noteDraft}
+                onChange={setNoteDraft}
+                placeholder="e.g. Sambar stag, good condition"
+              />
+              <div style={{ display: "flex", gap: 8, marginTop: 8, marginBottom: 16, flexWrap: "wrap" }}>
+                {TRACK_TAG_TYPES.map((t) => (
+                  <GhostButton key={t.value} icon={Crosshair} onClick={() => addTag(t.value)}>
+                    {t.label}
+                  </GhostButton>
+                ))}
+              </div>
+
+              <Divider />
+              <SectionLabel>Emergency</SectionLabel>
+              <div style={{ ...fontBody, fontSize: 12, color: C.steel, marginBottom: 10 }}>
+                Hold the button for two seconds to alert the farmer and any nearby opted-in hunters.
+              </div>
+              <button
+                onPointerDown={startSosHold}
+                onPointerUp={cancelSosHold}
+                onPointerLeave={cancelSosHold}
+                style={{
+                  position: "relative",
+                  width: "100%",
+                  padding: "16px 0",
+                  borderRadius: 10,
+                  border: "none",
+                  background: C.rust,
+                  color: C.white,
+                  cursor: "pointer",
+                  overflow: "hidden",
+                  ...fontBody,
+                  fontWeight: 700,
+                  fontSize: 14,
+                }}
+              >
+                <div
+                  style={{
+                    position: "absolute",
+                    inset: 0,
+                    left: 0,
+                    width: `${sosProgress * 100}%`,
+                    background: "rgba(255,255,255,0.28)",
+                    transition: sosProgress === 0 ? "width 0.15s ease-out" : "none",
+                  }}
+                />
+                <span style={{ position: "relative", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+                  <Siren size={16} /> HOLD FOR SOS
+                </span>
+              </button>
+              {sosSent && (
+                <div style={{ ...fontBody, fontSize: 12.5, color: C.rust, marginTop: 8, textAlign: "center" }}>
+                  SOS sent — the farmer and any nearby opted-in hunters have been alerted.
+                </div>
+              )}
+
+              <Divider />
+              <GhostButton full tone="rust" onClick={stopTracking}>
+                End tracking
+              </GhostButton>
+            </>
+          )}
+
+          {session.ended_at && (
+            <div style={{ ...fontBody, fontSize: 12.5, color: C.steel, textAlign: "center", padding: "12px 0" }}>
+              Tracking ended. {tags.length} tag{tags.length === 1 ? "" : "s"} recorded.
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------
+   SCREEN — TRACKING LIVE VIEW (farmer, read-only)
+   Polls a shared (or SOS-active) tracking session — the first
+   polling component in the codebase, so it explicitly pauses on
+   document.visibilitychange rather than burning requests in a
+   background tab.
+--------------------------------------------------------- */
+function TrackingLiveView({ sessionId, goBack }) {
+  const [session, setSession] = useState(null);
+  const [error, setError] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  function load() {
+    apiFetch(`/tracking/${sessionId}`)
+      .then((r) => {
+        if (!r.ok) return r.json().then((e) => Promise.reject(new Error(e.error)));
+        return r.json();
+      })
+      .then((data) => {
+        setSession(data);
+        setError(null);
+      })
+      .catch((e) => setError(e.message))
+      .finally(() => setLoading(false));
+  }
+
+  React.useEffect(() => {
+    load();
+    const interval = setInterval(() => {
+      if (document.visibilityState === "visible") load();
+    }, 20000);
+    return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId]);
+
+  const points = (session?.points || []).map((p) => [p.latitude, p.longitude]);
+  const lastPoint = points[points.length - 1] || null;
+
+  return (
+    <div>
+      <button
+        onClick={goBack}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 4,
+          background: "none",
+          border: "none",
+          padding: 0,
+          marginBottom: 12,
+          ...fontMono,
+          fontSize: 10.5,
+          color: C.steel,
+          cursor: "pointer",
+        }}
+      >
+        <ChevronLeft size={12} /> BACK
+      </button>
+
+      <div style={{ ...fontDisplay, fontSize: 20, color: C.charcoal }}>Live location</div>
+
+      {loading && <div style={{ ...fontMono, fontSize: 12, color: C.steel, marginTop: 10 }}>Loading…</div>}
+      {error && <div style={{ ...fontBody, fontSize: 12.5, color: C.rust, marginTop: 10 }}>{error}</div>}
+
+      {session && (
+        <>
+          <div style={{ ...fontBody, fontSize: 12.5, color: C.steel, marginTop: 2, marginBottom: 12 }}>
+            {session.ended_at
+              ? `Tracking ended ${session.ended_at}.`
+              : "Live now — updates every 20 seconds while this page is open."}
+          </div>
+          <div style={{ borderRadius: 12, overflow: "hidden", border: `1px solid ${C.line}` }}>
+            <MapContainer
+              center={lastPoint || [-37.05, 146.09]}
+              zoom={lastPoint ? 15 : 8}
+              style={{ height: 320, width: "100%" }}
+            >
+              <TileLayer
+                attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+                url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+              />
+              {points.length > 1 && (
+                <Polyline positions={points} pathOptions={{ color: C.eucalyptDeep, weight: 3 }} />
+              )}
+              {lastPoint && <Marker position={lastPoint} />}
+              {(session.tags || []).map((t) => (
+                <Marker key={t.id} position={[t.latitude, t.longitude]} icon={tagDivIcon(t.tag_type)} />
+              ))}
+            </MapContainer>
+          </div>
+        </>
       )}
     </div>
   );
@@ -2355,7 +2828,7 @@ function ReviewForm({ booking, onSubmitted }) {
    sent, with status, the ability to cancel or mark one done,
    and — once completed — leaving a review of the hunter.
 --------------------------------------------------------- */
-function FarmerBookings({ goMessages }) {
+function FarmerBookings({ goMessages, goTrackingView }) {
   const { user } = useAuth();
   const [bookings, setBookings] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -2493,6 +2966,11 @@ function FarmerBookings({ goMessages }) {
               {b.status === "approved" && (
                 <GhostButton onClick={() => updateStatus(b.id, "completed")}>
                   {actingId === b.id ? "…" : "Mark completed"}
+                </GhostButton>
+              )}
+              {b.tracking_session && (
+                <GhostButton icon={MapPin} onClick={() => goTrackingView(b.tracking_session.id)}>
+                  {b.tracking_session.ended_at ? "View past track" : "View live location"}
                 </GhostButton>
               )}
             </div>
@@ -4265,6 +4743,9 @@ function LoginScreen({ onLoggedIn }) {
     user?.availability_interval != null ? String(user.availability_interval) : "2"
   );
   const [acctAvailAnchor, setAcctAvailAnchor] = useState(user?.availability_anchor_date || "");
+  const [acctEmergencyName, setAcctEmergencyName] = useState(user?.emergency_contact_name || "");
+  const [acctEmergencyPhone, setAcctEmergencyPhone] = useState(user?.emergency_contact_phone || "");
+  const [acctSosOptIn, setAcctSosOptIn] = useState(!!user?.sos_alert_opt_in);
   const [acctSaving, setAcctSaving] = useState(false);
   const [acctError, setAcctError] = useState(null);
   const [acctSaved, setAcctSaved] = useState(false);
@@ -4288,6 +4769,9 @@ function LoginScreen({ onLoggedIn }) {
       body.availability_days = acctAvailMode === "weekly" ? acctAvailDays.join(",") : null;
       body.availability_interval = acctAvailMode === "interval" ? parseInt(acctAvailInterval, 10) || null : null;
       body.availability_anchor_date = acctAvailMode === "interval" ? acctAvailAnchor || null : null;
+      body.emergency_contact_name = acctEmergencyName;
+      body.emergency_contact_phone = acctEmergencyPhone;
+      body.sos_alert_opt_in = acctSosOptIn;
     }
     apiFetch("/me", { method: "PATCH", body })
       .then((r) => {
@@ -4406,6 +4890,39 @@ function LoginScreen({ onLoggedIn }) {
           </>
         )}
 
+        {user.role === "hunter" && (
+          <>
+            <Divider />
+            <SectionLabel>Live tracking &amp; SOS</SectionLabel>
+            <EnableAlertsBanner />
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              <div className="muster-two-col">
+                <TextField
+                  label="EMERGENCY CONTACT NAME"
+                  value={acctEmergencyName}
+                  onChange={setAcctEmergencyName}
+                  placeholder="Next of kin or similar"
+                />
+                <TextField
+                  label="EMERGENCY CONTACT PHONE"
+                  value={acctEmergencyPhone}
+                  onChange={setAcctEmergencyPhone}
+                  placeholder="0400 000 000"
+                />
+              </div>
+              <div style={{ ...fontBody, fontSize: 11.5, color: C.steel }}>
+                Shown to the farmer during an SOS so they can call — the app itself can't ring or text
+                them directly.
+              </div>
+              <Checkbox
+                label="Alert me if another hunter nearby triggers an SOS while I'm tracking"
+                checked={acctSosOptIn}
+                onChange={setAcctSosOptIn}
+              />
+            </div>
+          </>
+        )}
+
         {acctError && <div style={{ ...fontBody, fontSize: 12.5, color: C.rust, marginTop: 10 }}>{acctError}</div>}
         {acctSaved && !acctError && (
           <div style={{ ...fontBody, fontSize: 12.5, color: C.eucalyptDeep, marginTop: 10 }}>Saved.</div>
@@ -4479,6 +4996,8 @@ function AppShell() {
   const [selectedBookingId, setSelectedBookingId] = useState(null);
   const [selectedBookingParty, setSelectedBookingParty] = useState(null);
   const [messagesReturnScreen, setMessagesReturnScreen] = useState("booking");
+  const [trackingBooking, setTrackingBooking] = useState(null);
+  const [trackingViewSessionId, setTrackingViewSessionId] = useState(null);
 
   function openProfile(id, name) {
     setSelectedHunterId(id);
@@ -4491,6 +5010,16 @@ function AppShell() {
     setSelectedBookingParty(otherPartyName);
     setMessagesReturnScreen(returnScreen);
     setScreen("messages");
+  }
+
+  function openLiveTracker(booking) {
+    setTrackingBooking(booking);
+    setScreen("liveTracker");
+  }
+
+  function openTrackingView(sessionId) {
+    setTrackingViewSessionId(sessionId);
+    setScreen("trackingView");
   }
 
   // access controls which tabs show in the bar:
@@ -4760,8 +5289,21 @@ function AppShell() {
               goMessages={openMessages}
             />
           )}
-          {screen === "farmerBookings" && <FarmerBookings goMessages={openMessages} />}
-          {screen === "hunterBookings" && <HunterBookings goMessages={openMessages} />}
+          {screen === "farmerBookings" && (
+            <FarmerBookings goMessages={openMessages} goTrackingView={openTrackingView} />
+          )}
+          {screen === "trackingView" && (
+            <TrackingLiveView
+              sessionId={trackingViewSessionId}
+              goBack={() => setScreen("farmerBookings")}
+            />
+          )}
+          {screen === "hunterBookings" && (
+            <HunterBookings goMessages={openMessages} goLiveTracker={openLiveTracker} />
+          )}
+          {screen === "liveTracker" && (
+            <LiveTracker booking={trackingBooking} goBack={() => setScreen("hunterBookings")} />
+          )}
           {screen === "hunterCredentials" && <HunterCredentials />}
           {screen === "news" && <NewsFeed />}
           {screen === "messages" && (
@@ -4810,6 +5352,234 @@ function AppShell() {
   );
 }
 
+function urlBase64ToUint8Array(base64String) {
+  const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+  const rawData = atob(base64);
+  return Uint8Array.from([...rawData].map((c) => c.charCodeAt(0)));
+}
+
+// Push permission must come from a real user gesture (a click), never
+// requested on page load — this hook backs an explicit "Enable" button.
+function useNotificationSetup() {
+  const supported = typeof window !== "undefined" && "serviceWorker" in navigator && "PushManager" in window;
+  const [permission, setPermission] = useState(() =>
+    typeof Notification !== "undefined" ? Notification.permission : "unsupported"
+  );
+  const [subscribing, setSubscribing] = useState(false);
+  const [error, setError] = useState(null);
+
+  function enable() {
+    setSubscribing(true);
+    setError(null);
+    Notification.requestPermission()
+      .then((perm) => {
+        setPermission(perm);
+        if (perm !== "granted") throw new Error("Notification permission wasn't granted.");
+        return navigator.serviceWorker.ready;
+      })
+      .then((registration) =>
+        apiFetch("/push/vapid-public-key")
+          .then((r) => r.json())
+          .then(({ publicKey }) =>
+            registration.pushManager.subscribe({
+              userVisibleOnly: true,
+              applicationServerKey: urlBase64ToUint8Array(publicKey),
+            })
+          )
+      )
+      .then((subscription) => apiFetch("/push/subscribe", { method: "POST", body: subscription.toJSON() }))
+      .catch((e) => setError(e.message))
+      .finally(() => setSubscribing(false));
+  }
+
+  return { supported, permission, subscribing, error, enable };
+}
+
+// Reusable on both the farmer dashboard and the hunter account screen —
+// copy differs slightly by role, but the mechanics (real Web Push, no
+// third-party service) are identical.
+function EnableAlertsBanner() {
+  const { user } = useAuth();
+  const { supported, permission, subscribing, error, enable } = useNotificationSetup();
+  if (!supported || permission === "granted" || permission === "denied") return null;
+
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 10,
+        background: C.mist,
+        border: `1px solid ${C.line}`,
+        borderRadius: 10,
+        padding: 12,
+        marginBottom: 14,
+      }}
+    >
+      <Siren size={16} color={C.rust} style={{ flexShrink: 0 }} />
+      <div style={{ flex: 1 }}>
+        <div style={{ ...fontBody, fontWeight: 600, fontSize: 12.5, color: C.charcoal }}>
+          Enable emergency alerts
+        </div>
+        <div style={{ ...fontBody, fontSize: 11.5, color: C.steel }}>
+          {user?.role === "farmer"
+            ? "Get notified immediately if a hunter on your property triggers an SOS."
+            : "Get notified if a nearby hunter triggers an SOS (only while you're opted in below)."}
+        </div>
+        {error && <div style={{ ...fontBody, fontSize: 11, color: C.rust, marginTop: 4 }}>{error}</div>}
+      </div>
+      <GhostButton onClick={enable}>{subscribing ? "…" : "Enable"}</GhostButton>
+    </div>
+  );
+}
+
+// In-app SOS fallback — push delivery isn't guaranteed, so this polls
+// GET /api/sos/active regardless, surfacing anything unresolved on
+// every screen (fixed to the top) rather than just the tracking view.
+function SosActiveBanner() {
+  const { user } = useAuth();
+  const [alerts, setAlerts] = useState([]);
+
+  function load() {
+    if (!user) return;
+    apiFetch("/sos/active")
+      .then((r) => (r.ok ? r.json() : []))
+      .then(setAlerts)
+      .catch(() => {});
+  }
+
+  React.useEffect(() => {
+    if (!user) {
+      setAlerts([]);
+      return;
+    }
+    load();
+    const interval = setInterval(() => {
+      if (document.visibilityState === "visible") load();
+    }, 20000);
+    return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.id, user?.role]);
+
+  function resolve(id) {
+    apiFetch(`/sos/${id}`, { method: "PATCH" }).then(load);
+  }
+
+  if (!user || alerts.length === 0) return null;
+
+  return (
+    <div style={{ position: "fixed", top: 0, left: 0, right: 0, zIndex: 1100 }}>
+      {alerts.map((a) => (
+        <div
+          key={a.id}
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 10,
+            maxWidth: 460,
+            margin: "0 auto",
+            background: C.rust,
+            color: C.white,
+            padding: "10px 16px",
+            ...fontBody,
+            fontSize: 12,
+          }}
+        >
+          <Siren size={14} style={{ flexShrink: 0 }} />
+          <span style={{ flex: 1 }}>
+            {user.role === "farmer"
+              ? `SOS — ${a.hunter_name} needs help${a.property_name ? ` at ${a.property_name}` : ""}.`
+              : `SOS — ${a.hunter_name} needs help nearby.`}
+            {a.emergency_contact_phone && (
+              <> Contact: {a.emergency_contact_name || "—"} {a.emergency_contact_phone}</>
+            )}
+          </span>
+          {user.role === "farmer" && (
+            <button
+              onClick={() => resolve(a.id)}
+              style={{
+                background: "rgba(255,255,255,0.18)",
+                border: "none",
+                borderRadius: 6,
+                padding: "5px 10px",
+                color: C.white,
+                ...fontBody,
+                fontWeight: 600,
+                fontSize: 11,
+                cursor: "pointer",
+                flexShrink: 0,
+              }}
+            >
+              Resolve
+            </button>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// A hunter may be mid-session with GPS actively streaming when a new
+// version deploys — silently reloading the tab (the vite-plugin-pwa
+// default) would kill that. Show a dismissible toast instead; the update
+// applies whenever they choose (or next natural reload).
+function PwaUpdateToast() {
+  const {
+    needRefresh: [needRefresh, setNeedRefresh],
+    updateServiceWorker,
+  } = useRegisterSW();
+
+  if (!needRefresh) return null;
+
+  return (
+    <div
+      style={{
+        position: "fixed",
+        bottom: 16,
+        left: 16,
+        right: 16,
+        maxWidth: 420,
+        margin: "0 auto",
+        background: C.charcoal,
+        color: C.white,
+        borderRadius: 10,
+        padding: "12px 14px",
+        display: "flex",
+        alignItems: "center",
+        gap: 10,
+        zIndex: 1000,
+        boxShadow: "0 4px 16px rgba(0,0,0,0.25)",
+      }}
+    >
+      <RefreshCw size={15} style={{ flexShrink: 0 }} />
+      <span style={{ ...fontBody, fontSize: 12.5, flex: 1 }}>A new version is available.</span>
+      <button
+        onClick={() => updateServiceWorker(true)}
+        style={{
+          background: C.eucalyptDeep,
+          color: C.white,
+          border: "none",
+          borderRadius: 6,
+          padding: "6px 10px",
+          ...fontBody,
+          fontWeight: 600,
+          fontSize: 12,
+          cursor: "pointer",
+        }}
+      >
+        Update
+      </button>
+      <button
+        onClick={() => setNeedRefresh(false)}
+        style={{ background: "none", border: "none", color: C.line, cursor: "pointer", padding: 4 }}
+      >
+        <X size={14} />
+      </button>
+    </div>
+  );
+}
+
 export default function App() {
   const [user, setUser] = useState(null);
   const [rehydrating, setRehydrating] = useState(true);
@@ -4853,7 +5623,9 @@ export default function App() {
 
   return (
     <AuthContext.Provider value={{ user, login, logout, updateProperty, updateSelf }}>
+      <SosActiveBanner />
       <AppShell />
+      <PwaUpdateToast />
     </AuthContext.Provider>
   );
 }

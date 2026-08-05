@@ -2,8 +2,15 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="icon" href="/favicon.ico" sizes="any" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <!-- iOS ignores the manifest's icons entirely and needs this PNG
+         directly — also a prerequisite for Web Push to work on iOS at
+         all, since it only works once the PWA is added to the home
+         screen (see the tracking-PWA plan's "known constraints"). -->
+    <link rel="apple-touch-icon" href="/apple-touch-icon-180x180.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#37452F" />
     <title>vite-project</title>
   </head>
   <body>

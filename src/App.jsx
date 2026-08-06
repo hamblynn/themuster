@@ -1255,14 +1255,18 @@ const CREDENTIAL_LABELS = {
 };
 
 function HunterProfile({ hunterId, goBooking, goBack }) {
+  const { user } = useAuth();
   const [hunter, setHunter] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
+  const nearPropertyId = user?.role === "farmer" ? user?.properties?.[0]?.id : null;
+
   React.useEffect(() => {
     if (!hunterId) return;
     setLoading(true);
-    apiFetch(`/hunters/${hunterId}`)
+    const qs = nearPropertyId ? `?near_property_id=${nearPropertyId}` : "";
+    apiFetch(`/hunters/${hunterId}${qs}`)
       .then((r) => {
         if (!r.ok) throw new Error("Could not load hunter");
         return r.json();
@@ -1273,7 +1277,7 @@ function HunterProfile({ hunterId, goBooking, goBack }) {
       })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
-  }, [hunterId]);
+  }, [hunterId, nearPropertyId]);
 
   const BackLink = () => (
     <button
@@ -1409,6 +1413,13 @@ function HunterProfile({ hunterId, goBooking, goBack }) {
         {hunter.referral_count > 0
           ? `Referred by ${hunter.referral_count} farmer${hunter.referral_count === 1 ? "" : "s"} nearby.`
           : "No referrals from neighbouring farmers yet."}
+        {hunter.nearby_host_count != null && (
+          <div style={{ marginTop: hunter.referral_count > 0 ? 6 : 0 }}>
+            {hunter.nearby_host_count > 0
+              ? `Hosted by ${hunter.nearby_host_count} farmer${hunter.nearby_host_count === 1 ? "" : "s"} within ${hunter.nearby_radius_km}km of you.`
+              : `No farmers within ${hunter.nearby_radius_km}km of you have hosted them yet.`}
+          </div>
+        )}
       </div>
 
       <Divider />
@@ -1425,10 +1436,18 @@ function HunterProfile({ hunterId, goBooking, goBack }) {
           {hunter.reviews.map((r) => (
             <div key={r.id} style={{ background: C.paperDim, borderRadius: 10, padding: 12 }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                <StarRow rating={r.rating} />
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <Avatar initials={initialsOf(r.farmer_name)} size={24} />
+                  <span style={{ ...fontBody, fontWeight: 600, fontSize: 12, color: C.charcoal }}>
+                    {r.farmer_name}
+                  </span>
+                </div>
                 <span style={{ ...fontMono, fontSize: 10, color: C.steel }}>
                   {new Date(r.created_at).toLocaleDateString("en-AU")}
                 </span>
+              </div>
+              <div style={{ marginTop: 6 }}>
+                <StarRow rating={r.rating} />
               </div>
               {r.comment && (
                 <div style={{ ...fontBody, fontSize: 12.5, color: C.bark, marginTop: 6 }}>{r.comment}</div>

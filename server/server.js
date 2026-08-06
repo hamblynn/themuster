@@ -879,7 +879,15 @@ app.get("/api/properties/:id/regional-pressure", requireAuth("farmer"), (req, re
 // HUNTERS (public profile view + credential self-service)
 // ===========================================================
 
-// GET /api/hunters/:id — any logged-in user can view a hunter's public profile
+// Reviews are attributed (reviewer name shown), and a farmer viewing a
+// hunter's profile can see how many *other* farmers within this radius
+// have actually hosted them (completed booking, not just reviewed) — a
+// social-proof signal distinct from the referral count above it.
+const HOSTED_NEARBY_RADIUS_KM = 25;
+
+// GET /api/hunters/:id — any logged-in user can view a hunter's public profile.
+// A farmer viewer can pass ?near_property_id=<one of their own properties>
+// to also get back nearby_host_count/nearby_radius_km.
 app.get("/api/hunters/:id", requireAuth(), (req, res) => {
   const hunter = db.prepare(`SELECT * FROM hunters WHERE id = ?`).get(req.params.id);
   if (!hunter) return res.status(404).json({ error: "Hunter not found" });
@@ -887,8 +895,11 @@ app.get("/api/hunters/:id", requireAuth(), (req, res) => {
   hunter.credentials = db.prepare(`SELECT * FROM credentials WHERE hunter_id = ?`).all(hunter.id);
   hunter.reviews = db
     .prepare(
-      `SELECT r.* FROM reviews r
+      `SELECT r.*, f.id AS farmer_id, f.name AS farmer_name
+       FROM reviews r
        JOIN bookings b ON b.id = r.booking_id
+       JOIN properties p ON p.id = b.property_id
+       JOIN farmers f ON f.id = p.farmer_id
        WHERE b.hunter_id = ? AND r.author_type = 'farmer'
        ORDER BY r.created_at DESC`
     )
@@ -896,6 +907,33 @@ app.get("/api/hunters/:id", requireAuth(), (req, res) => {
   hunter.referral_count = db
     .prepare(`SELECT COUNT(*) AS n FROM referrals WHERE hunter_id = ?`)
     .get(hunter.id).n;
+
+  if (req.user.role === "farmer" && req.query.near_property_id) {
+    const viewerProperty = db
+      .prepare(`SELECT * FROM properties WHERE id = ?`)
+      .get(req.query.near_property_id);
+    if (viewerProperty && viewerProperty.farmer_id === req.user.id) {
+      const hostProperties = db
+        .prepare(
+          `SELECT DISTINCT p.farmer_id, p.latitude, p.longitude
+           FROM bookings b
+           JOIN properties p ON p.id = b.property_id
+           WHERE b.hunter_id = ? AND b.status = 'completed' AND p.farmer_id != ?`
+        )
+        .all(hunter.id, req.user.id);
+      const nearbyFarmerIds = new Set(
+        hostProperties
+          .filter(
+            (p) =>
+              distanceKm(viewerProperty.latitude, viewerProperty.longitude, p.latitude, p.longitude) <=
+              HOSTED_NEARBY_RADIUS_KM
+          )
+          .map((p) => p.farmer_id)
+      );
+      hunter.nearby_host_count = nearbyFarmerIds.size;
+      hunter.nearby_radius_km = HOSTED_NEARBY_RADIUS_KM;
+    }
+  }
 
   res.json(omitPassword(hunter));
 });

@@ -77,11 +77,14 @@ const insertPropertySpecies = db.prepare(`
   { species: "deer", other_description: null, atcw_document_url: null, atcw_remaining_quantity: null, atcw_expiry_date: null },
   { species: "fox", other_description: null, atcw_document_url: null, atcw_remaining_quantity: null, atcw_expiry_date: null },
   {
+    // Deliberately within the 8-week ATCW expiry warning window (see
+    // atcwExpiryStatus() in server.js) so the reminder feature has
+    // something to show out of the box, not just on manual testing.
     species: "kangaroo_atcw",
     other_description: null,
     atcw_document_url: "https://drive.example.com/riverbend-atcw-kangaroo.pdf",
     atcw_remaining_quantity: 40,
-    atcw_expiry_date: "2027-02-01",
+    atcw_expiry_date: "2026-09-20",
   },
 ].forEach((s) => insertPropertySpecies.run({ property_id: propertyId, ...s }));
 

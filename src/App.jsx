@@ -266,8 +266,8 @@ function Divider({ mt = 16, mb = 16 }) {
 }
 
 function Pill({ children, tone = "mist" }) {
-  const bg = tone === "mist" ? C.mist : tone === "gold" ? "#F1E3C4" : C.paperDim;
-  const fg = tone === "gold" ? C.goldDeep : C.bark;
+  const bg = tone === "mist" ? C.mist : tone === "gold" ? "#F1E3C4" : tone === "rust" ? "#F1DCD6" : C.paperDim;
+  const fg = tone === "gold" ? C.goldDeep : tone === "rust" ? C.rust : C.bark;
   return (
     <span
       style={{
@@ -282,6 +282,27 @@ function Pill({ children, tone = "mist" }) {
     >
       {children}
     </span>
+  );
+}
+
+// Shared between HunterBookings and FarmerBookings — a booking's
+// property.atcw_expiry_warnings (from GET /api/bookings), so a hunter
+// knows before they turn up that the permit covering a species is
+// about to lapse, rather than finding out on a manually-posted news item.
+function AtcwWarnings({ warnings }) {
+  if (!warnings || warnings.length === 0) return null;
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 10 }}>
+      {warnings.map((w, i) => (
+        <div key={i} style={{ display: "flex", gap: 6, alignItems: "flex-start" }}>
+          <AlertTriangle size={13} color={C.rust} style={{ marginTop: 1, flexShrink: 0 }} />
+          <span style={{ ...fontBody, fontSize: 12, color: C.rust }}>
+            {w.label} ATCW permit {w.status === "expired" ? "expired" : "expires"} {w.expiry_date} — confirm
+            before the visit.
+          </span>
+        </div>
+      ))}
+    </div>
   );
 }
 
@@ -582,10 +603,16 @@ function PropertyMap({ property, onSightingAdded }) {
             {property.species.map((s) => {
               const label = s.is_other ? s.other_description || "Other" : s.label;
               const isAtcw = !!s.requires_atcw;
+              const expired = s.atcw_expiry_status === "expired";
+              const expiringSoon = s.atcw_expiry_status === "expiring_soon";
               return (
-                <Pill key={s.id} tone={isAtcw ? "gold" : "mist"}>
+                <Pill key={s.id} tone={expired ? "rust" : isAtcw ? "gold" : "mist"}>
+                  {(expired || expiringSoon) && (
+                    <AlertTriangle size={10} style={{ verticalAlign: -1, marginRight: 3 }} />
+                  )}
                   {label}
                   {isAtcw ? ` · ${s.atcw_remaining_quantity ?? "?"} left · exp ${s.atcw_expiry_date || "?"}` : ""}
+                  {expired ? " · EXPIRED" : expiringSoon ? " · expiring soon" : ""}
                 </Pill>
               );
             })}
@@ -2301,6 +2328,7 @@ function HunterBookings({ goMessages, goLiveTracker }) {
                   <span style={{ ...fontBody, fontSize: 12, color: C.bark }}>{b.farmer_note}</span>
                 </div>
               )}
+              <AtcwWarnings warnings={b.atcw_expiry_warnings} />
 
               <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap" }}>
                 <PrimaryButton icon={Check} onClick={() => respond(b.id, "approved")}>
@@ -2343,6 +2371,7 @@ function HunterBookings({ goMessages, goLiveTracker }) {
                   </div>
                   <Pill tone={b.status === "declined" ? "gold" : "mist"}>{b.status.toUpperCase()}</Pill>
                 </div>
+                <AtcwWarnings warnings={b.atcw_expiry_warnings} />
 
                 <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
                   {(b.status === "approved" || b.status === "completed") && (
@@ -3037,6 +3066,7 @@ function FarmerBookings({ goMessages, goTrackingView }) {
                 {b.status.toUpperCase()}
               </Pill>
             </div>
+            <AtcwWarnings warnings={b.atcw_expiry_warnings} />
 
             <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 12, flexWrap: "wrap" }}>
               <GhostButton icon={MessageSquare} onClick={() => goMessages(b.id, b.hunter_name, "farmerBookings")}>

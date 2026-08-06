@@ -117,6 +117,29 @@ function describeAvailability(hunter) {
   return "available daily";
 }
 
+// ATCW permit expiry — flags a species as 'expired' or 'expiring_soon'
+// (within ATCW_EXPIRY_WARNING_WEEKS) so the UI can warn the farmer and
+// any hunter booked on that property, instead of relying on someone
+// manually posting a news item about it.
+const ATCW_EXPIRY_WARNING_WEEKS = 8;
+function atcwExpiryStatus(expiryDateStr) {
+  if (!expiryDateStr) return null;
+  const today = new Date();
+  const expiry = new Date(`${expiryDateStr}T00:00:00`);
+  const daysUntil = Math.round((expiry - today) / (1000 * 60 * 60 * 24));
+  if (daysUntil < 0) return "expired";
+  if (daysUntil <= ATCW_EXPIRY_WARNING_WEEKS * 7) return "expiring_soon";
+  return null;
+}
+// Attaches atcw_expiry_status to each property_species row (only ever
+// set for requires_atcw rows — plain species just get null).
+function withAtcwExpiryStatus(speciesRows) {
+  return speciesRows.map((s) => ({
+    ...s,
+    atcw_expiry_status: s.requires_atcw ? atcwExpiryStatus(s.atcw_expiry_date) : null,
+  }));
+}
+
 function credentialLabel(type) {
   return {
     primesafe_field_harvester: "PRIMESAFE",
@@ -486,13 +509,15 @@ app.get("/api/properties/:id", requireAuth("farmer"), (req, res) => {
   }
 
   property.no_go_zones = db.prepare(`SELECT * FROM no_go_zones WHERE property_id = ?`).all(property.id);
-  property.species = db
-    .prepare(
-      `SELECT ps.*, gs.label, gs.requires_atcw, gs.is_other
-       FROM property_species ps JOIN game_species gs ON gs.value = ps.species
-       WHERE ps.property_id = ?`
-    )
-    .all(property.id);
+  property.species = withAtcwExpiryStatus(
+    db
+      .prepare(
+        `SELECT ps.*, gs.label, gs.requires_atcw, gs.is_other
+         FROM property_species ps JOIN game_species gs ON gs.value = ps.species
+         WHERE ps.property_id = ?`
+      )
+      .all(property.id)
+  );
   property.sightings = db
     .prepare(`SELECT * FROM sightings WHERE property_id = ? ORDER BY reported_date DESC`)
     .all(property.id);
@@ -587,13 +612,15 @@ app.post("/api/properties", requireAuth("farmer"), (req, res) => {
     insertPropertySpecies(propertyId, species);
 
     const created = db.prepare(`SELECT * FROM properties WHERE id = ?`).get(propertyId);
-    created.species = db
-      .prepare(
-        `SELECT ps.*, gs.label, gs.requires_atcw, gs.is_other
-         FROM property_species ps JOIN game_species gs ON gs.value = ps.species
-         WHERE ps.property_id = ?`
-      )
-      .all(propertyId);
+    created.species = withAtcwExpiryStatus(
+      db
+        .prepare(
+          `SELECT ps.*, gs.label, gs.requires_atcw, gs.is_other
+           FROM property_species ps JOIN game_species gs ON gs.value = ps.species
+           WHERE ps.property_id = ?`
+        )
+        .all(propertyId)
+    );
     res.status(201).json(created);
   } catch (e) {
     res.status(400).json({
@@ -649,13 +676,15 @@ app.patch("/api/properties/:id", requireAuth("farmer"), (req, res) => {
 
     const updated = db.prepare(`SELECT * FROM properties WHERE id = ?`).get(req.params.id);
     updated.no_go_zones = db.prepare(`SELECT * FROM no_go_zones WHERE property_id = ?`).all(updated.id);
-    updated.species = db
-      .prepare(
-        `SELECT ps.*, gs.label, gs.requires_atcw, gs.is_other
-         FROM property_species ps JOIN game_species gs ON gs.value = ps.species
-         WHERE ps.property_id = ?`
-      )
-      .all(updated.id);
+    updated.species = withAtcwExpiryStatus(
+      db
+        .prepare(
+          `SELECT ps.*, gs.label, gs.requires_atcw, gs.is_other
+           FROM property_species ps JOIN game_species gs ON gs.value = ps.species
+           WHERE ps.property_id = ?`
+        )
+        .all(updated.id)
+    );
     res.json(updated);
   } catch (e) {
     res.status(400).json({
@@ -1017,11 +1046,23 @@ app.get("/api/bookings", requireAuth(), (req, res) => {
 
   const declStmt = db.prepare(`SELECT * FROM harvest_declarations WHERE booking_id = ? ORDER BY created_at DESC`);
   const trackingStmt = db.prepare(`SELECT * FROM tracking_sessions WHERE booking_id = ? ORDER BY started_at DESC LIMIT 1`);
+  // Surfaced to both the farmer and the booked hunter — a hunter should
+  // know before they turn up that the permit covering (say) the kangaroo
+  // they're there for is about to lapse.
+  const atcwStmt = db.prepare(`
+    SELECT gs.label, ps.atcw_expiry_date
+    FROM property_species ps JOIN game_species gs ON gs.value = ps.species
+    WHERE ps.property_id = ? AND gs.requires_atcw = 1 AND ps.atcw_expiry_date IS NOT NULL
+  `);
   res.json(
     rows.map((b) => ({
       ...b,
       harvest_declarations: declStmt.all(b.id),
       tracking_session: trackingStmt.get(b.id) || null,
+      atcw_expiry_warnings: atcwStmt
+        .all(b.property_id)
+        .map((s) => ({ label: s.label, expiry_date: s.atcw_expiry_date, status: atcwExpiryStatus(s.atcw_expiry_date) }))
+        .filter((s) => s.status),
     }))
   );
 });

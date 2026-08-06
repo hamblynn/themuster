@@ -74,8 +74,10 @@ const fontBody = { fontFamily: "'IBM Plex Sans', ui-sans-serif, system-ui" };
 const fontMono = { fontFamily: "'IBM Plex Mono', ui-monospace, monospace" };
 
 // Node backend (see /server) — run `npm run seed && npm start` in that folder.
-// Locally this defaults to localhost; deployed, set VITE_API_BASE (e.g. in
-// Vercel's project env vars) to the deployed backend's URL, ending in /api.
+// Locally this defaults to localhost. Deployed, VITE_API_BASE is set to the
+// relative path "/api" — vercel.json rewrites /api/* to the Render backend,
+// so the browser sees same-origin requests (and same-origin cookies) even
+// though the API actually lives on a different domain.
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:4000/api";
 
 // ---------------------------------------------------------

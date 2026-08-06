@@ -14,15 +14,14 @@ const TOKEN_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000;
 const COOKIE_NAME = "muster_token";
 const ADMIN_COOKIE_NAME = "muster_admin_token";
 
-// Locally, frontend and backend share a scheme (http) and are treated
-// as same-site by the browser, so "lax" + non-secure works. Deployed,
-// they're typically on two different domains (e.g. a Vercel frontend
-// calling a Render backend) — that's a cross-site request, which
-// requires "none" + secure (the browser rejects "none" without secure).
+// The Vercel frontend proxies /api/* to this Render backend (see
+// vercel.json), so from the browser's point of view every request is
+// same-origin — "lax" works in both dev and production. "secure" still
+// needs to track environment since local dev runs on plain http.
 const IN_PRODUCTION = process.env.NODE_ENV === "production";
 const BASE_COOKIE_OPTS = {
   httpOnly: true,
-  sameSite: IN_PRODUCTION ? "none" : "lax",
+  sameSite: "lax",
   secure: IN_PRODUCTION,
 };
 const COOKIE_OPTS = { ...BASE_COOKIE_OPTS, maxAge: TOKEN_EXPIRY_MS };

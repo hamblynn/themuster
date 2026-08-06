@@ -599,6 +599,7 @@ app.post("/api/properties", requireAuth("farmer"), (req, res) => {
   const {
     name, pic_code, lot_number, plan_number, address, suburb, latitude, longitude,
     size_hectares, access_notes, permitted_hours, allow_spotlighting, no_go_zones, species,
+    ownership_document_url,
   } = req.body;
 
   if (!name || !pic_code || latitude == null || longitude == null) {
@@ -612,9 +613,9 @@ app.post("/api/properties", requireAuth("farmer"), (req, res) => {
       .prepare(`
         INSERT INTO properties
           (farmer_id, name, pic_code, lot_number, plan_number, address, suburb, latitude, longitude,
-           size_hectares, access_notes, permitted_hours, allow_spotlighting)
+           size_hectares, access_notes, permitted_hours, allow_spotlighting, ownership_document_url)
         VALUES (@farmer_id, @name, @pic_code, @lot_number, @plan_number, @address, @suburb, @latitude, @longitude,
-                @size_hectares, @access_notes, @permitted_hours, @allow_spotlighting)
+                @size_hectares, @access_notes, @permitted_hours, @allow_spotlighting, @ownership_document_url)
       `)
       .run({
         farmer_id: req.user.id, name, pic_code,
@@ -627,6 +628,7 @@ app.post("/api/properties", requireAuth("farmer"), (req, res) => {
         access_notes: access_notes || null,
         permitted_hours: permitted_hours || null,
         allow_spotlighting: allow_spotlighting ? 1 : 0,
+        ownership_document_url: ownership_document_url || null,
       });
 
     const propertyId = result.lastInsertRowid;
@@ -675,7 +677,7 @@ app.patch("/api/properties/:id", requireAuth("farmer"), (req, res) => {
   const editable = [
     "name", "pic_code", "lot_number", "plan_number", "address", "suburb",
     "latitude", "longitude", "size_hectares", "access_notes",
-    "permitted_hours", "allow_spotlighting", "geofence_radius_m",
+    "permitted_hours", "allow_spotlighting", "geofence_radius_m", "ownership_document_url",
   ];
   const updates = {};
   editable.forEach((field) => {
@@ -688,6 +690,15 @@ app.patch("/api/properties/:id", requireAuth("farmer"), (req, res) => {
           : req.body[field];
     }
   });
+  // A changed ownership document is a new claim — send it back to
+  // 'pending' rather than leaving a stale admin verification attached
+  // to different evidence, mirroring how editing a hunter credential
+  // resets its status.
+  if (updates.ownership_document_url !== undefined && updates.ownership_document_url !== existing.ownership_document_url) {
+    updates.verification_status = "pending";
+    updates.verified_by_admin = null;
+    updates.verified_at = null;
+  }
 
   try {
     if (Object.keys(updates).length > 0) {
@@ -738,6 +749,7 @@ app.patch("/api/properties/:id", requireAuth("farmer"), (req, res) => {
 app.get("/api/admin/properties", requireAdminAuth, (req, res) => {
   const rows = db.prepare(`
     SELECT p.id, p.name, p.pic_code, p.suburb, p.created_at,
+           p.ownership_document_url, p.verification_status, p.verified_by_admin, p.verified_at,
            f.name AS farmer_name, f.email AS farmer_email,
            (SELECT COUNT(*) FROM property_species ps WHERE ps.property_id = p.id) AS species_count,
            (SELECT COUNT(*) FROM bookings b WHERE b.property_id = p.id) AS booking_count
@@ -746,6 +758,24 @@ app.get("/api/admin/properties", requireAdminAuth, (req, res) => {
     ORDER BY p.created_at DESC
   `).all();
   res.json(rows);
+});
+
+// PATCH /api/admin/properties/:id — verify or reject a property's
+// ownership claim. body: { verification_status: 'verified'|'rejected' }
+app.patch("/api/admin/properties/:id", requireAdminAuth, (req, res) => {
+  const { verification_status } = req.body;
+  if (!["verified", "rejected"].includes(verification_status)) {
+    return res.status(400).json({ error: "verification_status must be 'verified' or 'rejected'" });
+  }
+  const existing = db.prepare(`SELECT id FROM properties WHERE id = ?`).get(req.params.id);
+  if (!existing) return res.status(404).json({ error: "Property not found" });
+
+  const admin = db.prepare(`SELECT username FROM admins WHERE id = ?`).get(req.admin.id);
+  db.prepare(`
+    UPDATE properties SET verification_status = ?, verified_by_admin = ?, verified_at = datetime('now') WHERE id = ?
+  `).run(verification_status, admin?.username || "admin", req.params.id);
+
+  res.json(db.prepare(`SELECT * FROM properties WHERE id = ?`).get(req.params.id));
 });
 
 // DELETE /api/admin/properties/:id — deletes the property and

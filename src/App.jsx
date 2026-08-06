@@ -1168,10 +1168,28 @@ function FarmerDashboard({ goRefer, goProfile, goListProperty, goEditProperty })
             Edit property details
           </button>
         </div>
-        <Pill tone="gold">
-          {property.sightings.length} sighting{property.sightings.length === 1 ? "" : "s"} logged
-          {urgentCount > 0 ? ` · ${urgentCount} urgent` : ""}
-        </Pill>
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 6 }}>
+          <Pill tone="gold">
+            {property.sightings.length} sighting{property.sightings.length === 1 ? "" : "s"} logged
+            {urgentCount > 0 ? ` · ${urgentCount} urgent` : ""}
+          </Pill>
+          <EarTag
+            label={
+              property.verification_status === "verified"
+                ? "OWNERSHIP VERIFIED"
+                : property.verification_status === "rejected"
+                ? "OWNERSHIP REJECTED"
+                : "OWNERSHIP PENDING"
+            }
+            status={
+              property.verification_status === "verified"
+                ? "verified"
+                : property.verification_status === "rejected"
+                ? "missing"
+                : "warning"
+            }
+          />
+        </div>
       </div>
 
       <Divider mt={14} mb={14} />
@@ -3489,6 +3507,8 @@ function EditProperty({ goBack, onSaved }) {
   const [permittedHours, setPermittedHours] = useState("");
   const [allowSpotlighting, setAllowSpotlighting] = useState(false);
   const [geofenceRadiusM, setGeofenceRadiusM] = useState("1000");
+  const [ownershipDocumentUrl, setOwnershipDocumentUrl] = useState("");
+  const [verificationStatus, setVerificationStatus] = useState("pending");
   const [noGoZones, setNoGoZones] = useState([]);
   const [species, setSpecies] = useState({});
   const [speciesOptions, setSpeciesOptions] = useState([]);
@@ -3530,6 +3550,8 @@ function EditProperty({ goBack, onSaved }) {
         setPermittedHours(p.permitted_hours || "");
         setAllowSpotlighting(!!p.allow_spotlighting);
         setGeofenceRadiusM(p.geofence_radius_m != null ? String(p.geofence_radius_m) : "1000");
+        setOwnershipDocumentUrl(p.ownership_document_url || "");
+        setVerificationStatus(p.verification_status || "pending");
         setNoGoZones((p.no_go_zones || []).map((z) => ({ label: z.label, description: z.description || "" })));
         const speciesInit = {};
         (p.species || []).forEach((s) => {
@@ -3608,6 +3630,7 @@ function EditProperty({ goBack, onSaved }) {
         permitted_hours: permittedHours,
         allow_spotlighting: allowSpotlighting,
         geofence_radius_m: parseInt(geofenceRadiusM, 10) || 1000,
+        ownership_document_url: ownershipDocumentUrl,
         no_go_zones: noGoZones.filter((z) => z.label),
         species: checkedSpecies.map(([value, v]) => ({
           species: value,
@@ -3626,6 +3649,7 @@ function EditProperty({ goBack, onSaved }) {
       })
       .then((updated) => {
         setSaved(true);
+        setVerificationStatus(updated.verification_status || "pending");
         updateProperty(updated);
         if (onSaved) onSaved(updated);
       })
@@ -3732,6 +3756,36 @@ function EditProperty({ goBack, onSaved }) {
         <div style={{ ...fontBody, fontSize: 11.5, color: C.steel }}>
           How close a hunter's check-in/out needs to be to count as on-site, for bookings where you've
           required geofenced check-in.
+        </div>
+      </div>
+
+      <Divider />
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+        <SectionLabel>Ownership verification</SectionLabel>
+        <EarTag
+          label="OWNERSHIP"
+          status={
+            verificationStatus === "verified"
+              ? "verified"
+              : verificationStatus === "rejected"
+              ? "missing"
+              : "warning"
+          }
+        />
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        <TextField
+          label="PROOF OF OWNERSHIP DOCUMENT URL"
+          value={ownershipDocumentUrl}
+          onChange={setOwnershipDocumentUrl}
+          placeholder="Link to a rates notice or title, e.g. a Drive share link"
+        />
+        <div style={{ ...fontBody, fontSize: 11.5, color: C.steel }}>
+          {verificationStatus === "verified"
+            ? "An admin has verified this document."
+            : verificationStatus === "rejected"
+            ? "An admin rejected the last document — update the link and save to resubmit for review."
+            : "Awaiting admin review. Changing this link resubmits it for review."}
         </div>
       </div>
 
@@ -3866,6 +3920,7 @@ function FarmerSignup({ goDashboard, goBack }) {
   const [accessNotes, setAccessNotes] = useState("");
   const [permittedHours, setPermittedHours] = useState("");
   const [allowSpotlighting, setAllowSpotlighting] = useState(false);
+  const [ownershipDocumentUrl, setOwnershipDocumentUrl] = useState("");
   const [noGoLabel, setNoGoLabel] = useState("");
   const [noGoDescription, setNoGoDescription] = useState("");
   const [submitting, setSubmitting] = useState(false);
@@ -3902,6 +3957,7 @@ function FarmerSignup({ goDashboard, goBack }) {
             access_notes: accessNotes,
             permitted_hours: permittedHours,
             allow_spotlighting: allowSpotlighting,
+            ownership_document_url: ownershipDocumentUrl,
             no_go_zones: noGoLabel ? [{ label: noGoLabel, description: noGoDescription }] : [],
           },
         }).then((r) => {
@@ -4017,6 +4073,16 @@ function FarmerSignup({ goDashboard, goBack }) {
           checked={allowSpotlighting}
           onChange={setAllowSpotlighting}
         />
+        <TextField
+          label="PROOF OF OWNERSHIP DOCUMENT URL (OPTIONAL)"
+          value={ownershipDocumentUrl}
+          onChange={setOwnershipDocumentUrl}
+          placeholder="Link to a rates notice or title, e.g. a Drive share link"
+        />
+        <div style={{ ...fontBody, fontSize: 11.5, color: C.steel }}>
+          An admin reviews this to verify you're the owner or manager of this property. You can add
+          or update it later from Edit property if you skip it now.
+        </div>
       </div>
 
       <Divider />
@@ -4519,6 +4585,20 @@ function AdminPanel() {
       .catch((e) => setPropertiesError(e.message));
   }
 
+  function updatePropertyVerification(id, verification_status) {
+    setPropertiesError(null);
+    apiFetch(`/admin/properties/${id}`, {
+      method: "PATCH",
+      body: { verification_status },
+    })
+      .then((r) => {
+        if (!r.ok) return r.json().then((e) => Promise.reject(new Error(e.error)));
+        return r.json();
+      })
+      .then(loadProperties)
+      .catch((e) => setPropertiesError(e.message));
+  }
+
   function loadHunters() {
     setLoading(true);
     apiFetch("/admin/hunters")
@@ -4872,37 +4952,68 @@ function AdminPanel() {
             key={p.id}
             style={{
               display: "flex",
-              justifyContent: "space-between",
-              alignItems: "center",
+              flexDirection: "column",
+              gap: 8,
               border: `1px solid ${C.line}`,
               borderRadius: 8,
               padding: "8px 10px",
-              gap: 8,
             }}
           >
-            <div>
-              <div style={{ ...fontBody, fontSize: 13, color: C.charcoal }}>
-                {p.name}{p.suburb ? `, ${p.suburb}` : ""}
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+              <div>
+                <div style={{ ...fontBody, fontSize: 13, color: C.charcoal }}>
+                  {p.name}{p.suburb ? `, ${p.suburb}` : ""}
+                </div>
+                <div style={{ ...fontMono, fontSize: 9.5, color: C.steel, marginTop: 2 }}>
+                  {p.farmer_name} · {p.farmer_email} · PIC {p.pic_code} · {p.species_count} species ·{" "}
+                  {p.booking_count} booking{p.booking_count === 1 ? "" : "s"}
+                </div>
               </div>
-              <div style={{ ...fontMono, fontSize: 9.5, color: C.steel, marginTop: 2 }}>
-                {p.farmer_name} · {p.farmer_email} · PIC {p.pic_code} · {p.species_count} species ·{" "}
-                {p.booking_count} booking{p.booking_count === 1 ? "" : "s"}
+              <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
+                {confirmDeletePropertyId === p.id ? (
+                  <>
+                    <GhostButton tone="rust" onClick={() => deleteProperty(p.id)}>Confirm delete</GhostButton>
+                    <GhostButton onClick={() => setConfirmDeletePropertyId(null)}>Cancel</GhostButton>
+                  </>
+                ) : (
+                  <button
+                    onClick={() => setConfirmDeletePropertyId(p.id)}
+                    style={{ background: "none", border: "none", color: C.rust, cursor: "pointer", padding: 2 }}
+                    title="Delete property"
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                )}
               </div>
             </div>
-            <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
-              {confirmDeletePropertyId === p.id ? (
-                <>
-                  <GhostButton tone="rust" onClick={() => deleteProperty(p.id)}>Confirm delete</GhostButton>
-                  <GhostButton onClick={() => setConfirmDeletePropertyId(null)}>Cancel</GhostButton>
-                </>
-              ) : (
-                <button
-                  onClick={() => setConfirmDeletePropertyId(p.id)}
-                  style={{ background: "none", border: "none", color: C.rust, cursor: "pointer", padding: 2 }}
-                  title="Delete property"
-                >
-                  <Trash2 size={14} />
-                </button>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+              <div>
+                <EarTag
+                  label="OWNERSHIP"
+                  status={
+                    p.verification_status === "verified"
+                      ? "verified"
+                      : p.verification_status === "rejected"
+                      ? "missing"
+                      : "warning"
+                  }
+                />
+                <div style={{ ...fontMono, fontSize: 9.5, color: C.steel, marginTop: 2 }}>
+                  {p.ownership_document_url ? (
+                    <a href={p.ownership_document_url} target="_blank" rel="noreferrer" style={{ color: C.eucalyptDeep }}>
+                      view document ↗
+                    </a>
+                  ) : (
+                    "no document submitted"
+                  )}
+                  {p.verified_by_admin && ` · reviewed by ${p.verified_by_admin}`}
+                </div>
+              </div>
+              {p.verification_status !== "verified" && (
+                <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                  <GhostButton onClick={() => updatePropertyVerification(p.id, "verified")}>Verify</GhostButton>
+                  <GhostButton tone="rust" onClick={() => updatePropertyVerification(p.id, "rejected")}>Reject</GhostButton>
+                </div>
               )}
             </div>
           </div>

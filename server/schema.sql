@@ -72,6 +72,15 @@ CREATE TABLE properties (
   -- opts into geofenced check-in/check-out. Properties vary hugely in
   -- size, so this is per-property rather than one fixed constant.
   geofence_radius_m INTEGER NOT NULL DEFAULT 1000,
+  -- Proof-of-ownership review, mirroring the hunter credentials pattern
+  -- (status/verified_by_admin/verified_at) but as a single set of
+  -- columns rather than a child table, since a property has exactly one
+  -- ownership claim to review rather than several credential types.
+  ownership_document_url TEXT,
+  verification_status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (verification_status IN ('pending','verified','rejected')),
+  verified_by_admin TEXT,
+  verified_at       TEXT,
   created_at        TEXT NOT NULL DEFAULT (datetime('now'))
 );
 

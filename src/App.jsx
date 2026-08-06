@@ -306,6 +306,36 @@ function AtcwWarnings({ warnings }) {
   );
 }
 
+// Shared between HunterBookings and FarmerBookings — shows nothing
+// until the booking actually opted into geofencing; once a tracking
+// session exists, shows whether check-in/out actually happened within
+// the property's radius. Never implies enforcement (it isn't one) —
+// just visibility, per the "flag, don't block" decision.
+function GeofenceStatus({ booking }) {
+  if (!booking.geofence_required) return null;
+  const session = booking.tracking_session;
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 8 }}>
+      <MapPin size={12} color={C.steel} style={{ flexShrink: 0 }} />
+      <span style={{ ...fontMono, fontSize: 10, color: C.steel }}>
+        GEOFENCED
+        {session && session.checkin_in_geofence != null && (
+          <span style={{ color: session.checkin_in_geofence ? C.eucalyptDeep : C.rust }}>
+            {" "}
+            · check-in {session.checkin_in_geofence ? "on-site" : "OFF-SITE"}
+          </span>
+        )}
+        {session && session.ended_at && session.checkout_in_geofence != null && (
+          <span style={{ color: session.checkout_in_geofence ? C.eucalyptDeep : C.rust }}>
+            {" "}
+            · check-out {session.checkout_in_geofence ? "on-site" : "OFF-SITE"}
+          </span>
+        )}
+      </span>
+    </div>
+  );
+}
+
 function Avatar({ initials, size = 44 }) {
   return (
     <div
@@ -1448,6 +1478,7 @@ function BookingRequest({ hunterId, hunterName, goBack, goMessages }) {
   const [booking, setBooking] = useState(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState(null);
+  const [geofenceRequired, setGeofenceRequired] = useState(false);
 
   React.useEffect(() => {
     if (!hunterId) return;
@@ -1477,6 +1508,7 @@ function BookingRequest({ hunterId, hunterName, goBack, goMessages }) {
         start_time: "05:30",
         end_time: "09:00",
         farmer_note: "Livestock in the north paddock this week",
+        geofence_required: geofenceRequired,
       },
     })
       .then((r) => {
@@ -1525,6 +1557,7 @@ function BookingRequest({ hunterId, hunterName, goBack, goMessages }) {
         <div style={{ ...fontBody, fontSize: 13, color: C.bark, marginTop: 6 }}>
           {hunterName} will access {d.property_name} on {formatShortDate(booking.requested_date)},{" "}
           {booking.start_time}–{booking.end_time}. Status: {booking.status}.
+          {booking.geofence_required && " Geofenced check-in required."}
         </div>
 
         <Divider />
@@ -1657,6 +1690,17 @@ function BookingRequest({ hunterId, hunterName, goBack, goMessages }) {
             </div>
           </div>
         ))}
+      </div>
+
+      <Divider />
+      <Checkbox
+        label="Require geofenced check-in"
+        checked={geofenceRequired}
+        onChange={setGeofenceRequired}
+      />
+      <div style={{ ...fontBody, fontSize: 11.5, color: C.steel, marginTop: 4 }}>
+        {hunterName.split(" ")[0]} will see this before deciding whether to accept. Their check-in/out
+        location is recorded against the property boundary — never blocked, just flagged if it's off-site.
       </div>
 
       {error && (
@@ -2319,7 +2363,15 @@ function HunterBookings({ goMessages, goLiveTracker }) {
                     Requested by {b.farmer_name}
                   </div>
                 </div>
-                <Pill tone="gold">REQUESTED</Pill>
+                <div style={{ display: "flex", flexDirection: "column", gap: 4, alignItems: "flex-end" }}>
+                  <Pill tone="gold">REQUESTED</Pill>
+                  {b.geofence_required && (
+                    <Pill>
+                      <MapPin size={9} style={{ verticalAlign: -1, marginRight: 2 }} />
+                      Geofence required
+                    </Pill>
+                  )}
+                </div>
               </div>
 
               {b.farmer_note && (
@@ -2329,6 +2381,7 @@ function HunterBookings({ goMessages, goLiveTracker }) {
                 </div>
               )}
               <AtcwWarnings warnings={b.atcw_expiry_warnings} />
+              <GeofenceStatus booking={b} />
 
               <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap" }}>
                 <PrimaryButton icon={Check} onClick={() => respond(b.id, "approved")}>
@@ -2372,6 +2425,7 @@ function HunterBookings({ goMessages, goLiveTracker }) {
                   <Pill tone={b.status === "declined" ? "gold" : "mist"}>{b.status.toUpperCase()}</Pill>
                 </div>
                 <AtcwWarnings warnings={b.atcw_expiry_warnings} />
+                <GeofenceStatus booking={b} />
 
                 <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
                   {(b.status === "approved" || b.status === "completed") && (
@@ -2479,17 +2533,37 @@ function LiveTracker({ booking, goBack }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // For a geofence_required booking, grab a one-time GPS fix before
+  // starting so the server can verify it against the property's
+  // radius — soft enforcement, so a failed/denied fix just starts
+  // without a position (server records that as "couldn't verify"),
+  // it never blocks check-in.
   function startTracking() {
     setStarting(true);
     setError(null);
-    apiFetch(`/bookings/${booking.id}/tracking/start`, { method: "POST" })
-      .then((r) => {
-        if (!r.ok) return r.json().then((e) => Promise.reject(new Error(e.error)));
-        return r.json();
-      })
-      .then(setSession)
-      .catch((e) => setError(e.message))
-      .finally(() => setStarting(false));
+
+    function doStart(position) {
+      const body = position
+        ? { latitude: position.coords.latitude, longitude: position.coords.longitude }
+        : undefined;
+      apiFetch(`/bookings/${booking.id}/tracking/start`, { method: "POST", body })
+        .then((r) => {
+          if (!r.ok) return r.json().then((e) => Promise.reject(new Error(e.error)));
+          return r.json();
+        })
+        .then(setSession)
+        .catch((e) => setError(e.message))
+        .finally(() => setStarting(false));
+    }
+
+    if (booking.geofence_required && navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition(doStart, () => doStart(null), {
+        enableHighAccuracy: true,
+        timeout: 8000,
+      });
+    } else {
+      doStart(null);
+    }
   }
 
   function flushPendingPoints() {
@@ -2569,10 +2643,26 @@ function LiveTracker({ booking, goBack }) {
 
   function stopTracking() {
     flushPendingPoints();
-    apiFetch(`/tracking/${session.id}`, { method: "PATCH", body: { stop: true } })
-      .then((r) => r.json())
-      .then(setSession)
-      .catch(() => {});
+
+    function doStop(position) {
+      const body = {
+        stop: true,
+        ...(position ? { latitude: position.coords.latitude, longitude: position.coords.longitude } : {}),
+      };
+      apiFetch(`/tracking/${session.id}`, { method: "PATCH", body })
+        .then((r) => r.json())
+        .then(setSession)
+        .catch(() => {});
+    }
+
+    if (booking.geofence_required && navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition(doStop, () => doStop(null), {
+        enableHighAccuracy: true,
+        timeout: 8000,
+      });
+    } else {
+      doStop(null);
+    }
   }
 
   function triggerSos() {
@@ -2635,6 +2725,7 @@ function LiveTracker({ booking, goBack }) {
         Live tracker — private to you by default. Useful as a reference in the dark, whether or not you
         choose to share it.
       </div>
+      <GeofenceStatus booking={{ geofence_required: booking.geofence_required, tracking_session: session }} />
 
       {error && <div style={{ ...fontBody, fontSize: 12.5, color: C.rust, marginBottom: 10 }}>{error}</div>}
 
@@ -2827,7 +2918,8 @@ function TrackingLiveView({ sessionId, goBack }) {
               ? `Tracking ended ${session.ended_at}.`
               : "Live now — updates every 20 seconds while this page is open."}
           </div>
-          <div style={{ borderRadius: 12, overflow: "hidden", border: `1px solid ${C.line}` }}>
+          <GeofenceStatus booking={{ geofence_required: session.geofence_required, tracking_session: session }} />
+          <div style={{ borderRadius: 12, overflow: "hidden", border: `1px solid ${C.line}`, marginTop: 8 }}>
             <MapContainer
               center={lastPoint || [-37.05, 146.09]}
               zoom={lastPoint ? 15 : 8}
@@ -3067,6 +3159,7 @@ function FarmerBookings({ goMessages, goTrackingView }) {
               </Pill>
             </div>
             <AtcwWarnings warnings={b.atcw_expiry_warnings} />
+            <GeofenceStatus booking={b} />
 
             <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 12, flexWrap: "wrap" }}>
               <GhostButton icon={MessageSquare} onClick={() => goMessages(b.id, b.hunter_name, "farmerBookings")}>
@@ -3311,6 +3404,7 @@ function EditProperty({ goBack, onSaved }) {
   const [accessNotes, setAccessNotes] = useState("");
   const [permittedHours, setPermittedHours] = useState("");
   const [allowSpotlighting, setAllowSpotlighting] = useState(false);
+  const [geofenceRadiusM, setGeofenceRadiusM] = useState("1000");
   const [noGoZones, setNoGoZones] = useState([]);
   const [species, setSpecies] = useState({});
   const [speciesOptions, setSpeciesOptions] = useState([]);
@@ -3351,6 +3445,7 @@ function EditProperty({ goBack, onSaved }) {
         setAccessNotes(p.access_notes || "");
         setPermittedHours(p.permitted_hours || "");
         setAllowSpotlighting(!!p.allow_spotlighting);
+        setGeofenceRadiusM(p.geofence_radius_m != null ? String(p.geofence_radius_m) : "1000");
         setNoGoZones((p.no_go_zones || []).map((z) => ({ label: z.label, description: z.description || "" })));
         const speciesInit = {};
         (p.species || []).forEach((s) => {
@@ -3428,6 +3523,7 @@ function EditProperty({ goBack, onSaved }) {
         access_notes: accessNotes,
         permitted_hours: permittedHours,
         allow_spotlighting: allowSpotlighting,
+        geofence_radius_m: parseInt(geofenceRadiusM, 10) || 1000,
         no_go_zones: noGoZones.filter((z) => z.label),
         species: checkedSpecies.map(([value, v]) => ({
           species: value,
@@ -3542,6 +3638,17 @@ function EditProperty({ goBack, onSaved }) {
           checked={allowSpotlighting}
           onChange={setAllowSpotlighting}
         />
+        <TextField
+          label="CHECK-IN RADIUS (METRES)"
+          value={geofenceRadiusM}
+          onChange={setGeofenceRadiusM}
+          placeholder="1000"
+          type="number"
+        />
+        <div style={{ ...fontBody, fontSize: 11.5, color: C.steel }}>
+          How close a hunter's check-in/out needs to be to count as on-site, for bookings where you've
+          required geofenced check-in.
+        </div>
       </div>
 
       <Divider />

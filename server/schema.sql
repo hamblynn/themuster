@@ -68,6 +68,10 @@ CREATE TABLE properties (
   exclusivity_mode  TEXT NOT NULL DEFAULT 'shared'
                     CHECK (exclusivity_mode IN ('shared','exclusive_per_period')),
   active            INTEGER NOT NULL DEFAULT 1,
+  -- Circular geofence around (latitude, longitude), used when a booking
+  -- opts into geofenced check-in/check-out. Properties vary hugely in
+  -- size, so this is per-property rather than one fixed constant.
+  geofence_radius_m INTEGER NOT NULL DEFAULT 1000,
   created_at        TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -208,6 +212,10 @@ CREATE TABLE bookings (
   status          TEXT NOT NULL DEFAULT 'requested'
                   CHECK (status IN ('requested','approved','declined','completed','cancelled')),
   farmer_note     TEXT,     -- e.g. "livestock in north paddock this week"
+  -- Farmer opts into this per booking (not a fixed property setting) —
+  -- the hunter sees it before accepting, per the original ask: "the
+  -- hunter can decide if they want to take the booking."
+  geofence_required INTEGER NOT NULL DEFAULT 0,
   created_at      TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -309,6 +317,13 @@ CREATE TABLE tracking_sessions (
   started_at        TEXT NOT NULL DEFAULT (datetime('now')),
   ended_at          TEXT,                          -- NULL while active
   share_with_farmer INTEGER NOT NULL DEFAULT 0,
+  -- Only meaningful when the booking has geofence_required=1; NULL
+  -- otherwise (geofencing wasn't in effect, so there's nothing to flag).
+  -- Soft enforcement per product decision — check-in/out is never
+  -- blocked, just recorded, since a bad GPS fix shouldn't lock anyone
+  -- out.
+  checkin_in_geofence  INTEGER,
+  checkout_in_geofence INTEGER,
   created_at        TEXT NOT NULL DEFAULT (datetime('now'))
 );
 

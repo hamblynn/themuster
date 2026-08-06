@@ -675,12 +675,17 @@ app.patch("/api/properties/:id", requireAuth("farmer"), (req, res) => {
   const editable = [
     "name", "pic_code", "lot_number", "plan_number", "address", "suburb",
     "latitude", "longitude", "size_hectares", "access_notes",
-    "permitted_hours", "allow_spotlighting",
+    "permitted_hours", "allow_spotlighting", "geofence_radius_m",
   ];
   const updates = {};
   editable.forEach((field) => {
     if (req.body[field] !== undefined) {
-      updates[field] = field === "allow_spotlighting" ? (req.body[field] ? 1 : 0) : req.body[field];
+      updates[field] =
+        field === "allow_spotlighting"
+          ? (req.body[field] ? 1 : 0)
+          : field === "geofence_radius_m"
+          ? parseInt(req.body[field], 10) || 1000
+          : req.body[field];
     }
   });
 
@@ -1015,7 +1020,7 @@ function assertBookingAccess(req, res, booking) {
 // POST /api/bookings — logged-in farmer books a hunter on one of their own properties
 // body: { property_id, hunter_id, requested_date, start_time, end_time, farmer_note }
 app.post("/api/bookings", requireAuth("farmer"), (req, res) => {
-  const { property_id, hunter_id, requested_date, start_time, end_time, farmer_note } = req.body;
+  const { property_id, hunter_id, requested_date, start_time, end_time, farmer_note, geofence_required } = req.body;
   if (!property_id || !hunter_id || !requested_date) {
     return res.status(400).json({ error: "property_id, hunter_id and requested_date are required" });
   }
@@ -1034,10 +1039,10 @@ app.post("/api/bookings", requireAuth("farmer"), (req, res) => {
 
   const result = db
     .prepare(`
-      INSERT INTO bookings (property_id, hunter_id, requested_date, start_time, end_time, farmer_note, status)
-      VALUES (?, ?, ?, ?, ?, ?, 'requested')
+      INSERT INTO bookings (property_id, hunter_id, requested_date, start_time, end_time, farmer_note, geofence_required, status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'requested')
     `)
-    .run(property_id, hunter_id, requested_date, start_time || null, end_time || null, farmer_note || null);
+    .run(property_id, hunter_id, requested_date, start_time || null, end_time || null, farmer_note || null, geofence_required ? 1 : 0);
 
   const booking = db.prepare(`SELECT * FROM bookings WHERE id = ?`).get(result.lastInsertRowid);
 
@@ -1438,9 +1443,23 @@ app.get("/api/properties/:id/parcel", requireAuth("farmer"), async (req, res) =>
 const TRACK_TAG_TYPES = ["shot", "left", "processed"];
 const SOS_ALERT_RADIUS_KM = 20;
 
+// Soft enforcement by design (see the geofenced check-in/check-out
+// feature decision) — never blocks, just records whether a position
+// was actually within the property's circular geofence. Returns 0
+// (not 1) when no position was supplied at all, since "couldn't
+// verify" and "verified as off-site" both mean the farmer can't take
+// on-site presence for granted.
+function geofenceStatus(property, latitude, longitude) {
+  if (latitude == null || longitude == null) return 0;
+  const distanceM = distanceKm(property.latitude, property.longitude, latitude, longitude) * 1000;
+  return distanceM <= property.geofence_radius_m ? 1 : 0;
+}
+
 // POST /api/bookings/:id/tracking/start — hunter only, must be their
 // own approved booking. The partial unique index on tracking_sessions
-// enforces one active session per hunter at a time.
+// enforces one active session per hunter at a time. body (optional):
+// { latitude, longitude } — the hunter's position at check-in time,
+// used to verify geofence_required bookings.
 app.post("/api/bookings/:id/tracking/start", requireAuth("hunter"), (req, res) => {
   const booking = db.prepare(`SELECT * FROM bookings WHERE id = ?`).get(req.params.id);
   if (!booking) return res.status(404).json({ error: "Booking not found" });
@@ -1450,10 +1469,19 @@ app.post("/api/bookings/:id/tracking/start", requireAuth("hunter"), (req, res) =
   if (booking.status !== "approved") {
     return res.status(400).json({ error: "Tracking can only be started on an approved booking" });
   }
+
+  let checkinInGeofence = null;
+  if (booking.geofence_required) {
+    const property = db
+      .prepare(`SELECT latitude, longitude, geofence_radius_m FROM properties WHERE id = ?`)
+      .get(booking.property_id);
+    checkinInGeofence = geofenceStatus(property, req.body.latitude, req.body.longitude);
+  }
+
   try {
     const result = db
-      .prepare(`INSERT INTO tracking_sessions (booking_id, hunter_id) VALUES (?, ?)`)
-      .run(booking.id, req.user.id);
+      .prepare(`INSERT INTO tracking_sessions (booking_id, hunter_id, checkin_in_geofence) VALUES (?, ?, ?)`)
+      .run(booking.id, req.user.id, checkinInGeofence);
     res.status(201).json(db.prepare(`SELECT * FROM tracking_sessions WHERE id = ?`).get(result.lastInsertRowid));
   } catch (e) {
     if (e.message.includes("UNIQUE")) {
@@ -1463,9 +1491,10 @@ app.post("/api/bookings/:id/tracking/start", requireAuth("hunter"), (req, res) =
   }
 });
 
-// PATCH /api/tracking/:sessionId — owner hunter only. body: { stop: true }
-// to end the session (server sets ended_at, never trusts a client value),
-// and/or { share_with_farmer: bool }.
+// PATCH /api/tracking/:sessionId — owner hunter only. body: { stop: true,
+// latitude?, longitude? } to end the session (server sets ended_at,
+// never trusts a client value for the timestamp itself — the position
+// is only used for the geofence check), and/or { share_with_farmer: bool }.
 app.patch("/api/tracking/:sessionId", requireAuth("hunter"), (req, res) => {
   const session = db.prepare(`SELECT * FROM tracking_sessions WHERE id = ?`).get(req.params.sessionId);
   if (!session) return res.status(404).json({ error: "Tracking session not found" });
@@ -1476,7 +1505,16 @@ app.patch("/api/tracking/:sessionId", requireAuth("hunter"), (req, res) => {
     return res.status(400).json({ error: "This tracking session has already ended" });
   }
   if (req.body.stop) {
-    db.prepare(`UPDATE tracking_sessions SET ended_at = datetime('now') WHERE id = ?`).run(session.id);
+    const booking = db.prepare(`SELECT * FROM bookings WHERE id = ?`).get(session.booking_id);
+    let checkoutInGeofence = null;
+    if (booking.geofence_required) {
+      const property = db
+        .prepare(`SELECT latitude, longitude, geofence_radius_m FROM properties WHERE id = ?`)
+        .get(booking.property_id);
+      checkoutInGeofence = geofenceStatus(property, req.body.latitude, req.body.longitude);
+    }
+    db.prepare(`UPDATE tracking_sessions SET ended_at = datetime('now'), checkout_in_geofence = ? WHERE id = ?`)
+      .run(checkoutInGeofence, session.id);
   }
   if (req.body.share_with_farmer !== undefined) {
     db.prepare(`UPDATE tracking_sessions SET share_with_farmer = ? WHERE id = ?`).run(
@@ -1534,11 +1572,11 @@ app.post("/api/tracking/:sessionId/tags", requireAuth("hunter"), (req, res) => {
 app.get("/api/tracking/:sessionId", requireAuth(), (req, res) => {
   const session = db.prepare(`SELECT * FROM tracking_sessions WHERE id = ?`).get(req.params.sessionId);
   if (!session) return res.status(404).json({ error: "Tracking session not found" });
+  const booking = db.prepare(`SELECT * FROM bookings WHERE id = ?`).get(session.booking_id);
 
   const isOwnerHunter = req.user.role === "hunter" && session.hunter_id === req.user.id;
   let isFarmerAllowed = false;
   if (req.user.role === "farmer") {
-    const booking = db.prepare(`SELECT * FROM bookings WHERE id = ?`).get(session.booking_id);
     const property = booking && db.prepare(`SELECT farmer_id FROM properties WHERE id = ?`).get(booking.property_id);
     const ownsProperty = property?.farmer_id === req.user.id;
     const hasUnresolvedSos = !!db
@@ -1550,6 +1588,7 @@ app.get("/api/tracking/:sessionId", requireAuth(), (req, res) => {
     return res.status(403).json({ error: "You don't have access to this tracking session" });
   }
 
+  session.geofence_required = booking.geofence_required;
   session.points = db.prepare(`SELECT * FROM track_points WHERE session_id = ? ORDER BY recorded_at`).all(session.id);
   session.tags = db.prepare(`SELECT * FROM track_tags WHERE session_id = ? ORDER BY recorded_at`).all(session.id);
   res.json(session);

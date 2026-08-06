@@ -300,6 +300,19 @@ CREATE TABLE sightings (
   created_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- One row per hunter dispatched an alert for a given urgent sighting —
+-- records who was notified (and how far they were at the time) so a
+-- hunter can see it in-app even if the push never arrived or they
+-- weren't watching their (redirected, on this test site) inbox.
+CREATE TABLE sighting_dispatches (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  sighting_id   INTEGER NOT NULL REFERENCES sightings(id) ON DELETE CASCADE,
+  hunter_id     INTEGER NOT NULL REFERENCES hunters(id) ON DELETE CASCADE,
+  distance_km   REAL NOT NULL,
+  created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX idx_sighting_dispatches_hunter ON sighting_dispatches(hunter_id);
+
 -- ------------------------------------------------------------
 -- LIVE TRACKING & SOS
 -- A hunter's continuous GPS track during an approved booking visit

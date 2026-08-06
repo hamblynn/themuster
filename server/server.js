@@ -764,6 +764,13 @@ app.delete("/api/admin/properties/:id", requireAdminAuth, (req, res) => {
 // SIGHTINGS — farmer-logged pressure reports against their own property
 // ===========================================================
 
+// An urgent sighting dispatches to nearby, currently-available hunters —
+// email (see TEST_SITE_EMAIL_OVERRIDE above re: where that actually
+// lands on this test site) and push where they're subscribed, plus a
+// sighting_dispatches row so a hunter can see it in-app even if neither
+// delivery channel reaches them.
+const SIGHTING_DISPATCH_RADIUS_KM = 25;
+
 // POST /api/sightings — owner only
 // body: { property_id, species, estimated_count, damage_notes, latitude, longitude, urgent }
 app.post("/api/sightings", requireAuth("farmer"), (req, res) => {
@@ -771,7 +778,7 @@ app.post("/api/sightings", requireAuth("farmer"), (req, res) => {
   if (!property_id) {
     return res.status(400).json({ error: "property_id is required" });
   }
-  const property = db.prepare(`SELECT farmer_id FROM properties WHERE id = ?`).get(property_id);
+  const property = db.prepare(`SELECT * FROM properties WHERE id = ?`).get(property_id);
   if (!property || property.farmer_id !== req.user.id) {
     return res.status(403).json({ error: "You can only report sightings on your own properties" });
   }
@@ -791,7 +798,65 @@ app.post("/api/sightings", requireAuth("farmer"), (req, res) => {
       urgent ? 1 : 0
     );
 
-  res.status(201).json(db.prepare(`SELECT * FROM sightings WHERE id = ?`).get(result.lastInsertRowid));
+  const sighting = db.prepare(`SELECT * FROM sightings WHERE id = ?`).get(result.lastInsertRowid);
+
+  let dispatchedHunterCount = 0;
+  if (sighting.urgent) {
+    const today = new Date().toISOString().slice(0, 10);
+    const nearbyHunters = db
+      .prepare(`SELECT * FROM hunters WHERE is_active = 1`)
+      .all()
+      .map((h) => ({ ...h, distance_km: distanceKm(property.latitude, property.longitude, h.latitude, h.longitude) }))
+      .filter((h) => h.distance_km <= SIGHTING_DISPATCH_RADIUS_KM && isHunterAvailable(h, today));
+
+    const speciesLabel = sighting.species || "Pest";
+    const payload = {
+      type: "sighting",
+      sighting_id: sighting.id,
+      property_name: property.name,
+      species: sighting.species,
+    };
+
+    nearbyHunters.forEach((h) => {
+      db.prepare(`INSERT INTO sighting_dispatches (sighting_id, hunter_id, distance_km) VALUES (?, ?, ?)`)
+        .run(sighting.id, h.id, h.distance_km);
+
+      sendEmail(
+        `Urgent sighting near you — ${speciesLabel} at ${property.name}`,
+        `<p><strong>${speciesLabel}</strong> reported at <strong>${property.name}</strong>, ${(h.distance_km).toFixed(1)}km from you.</p>` +
+          (sighting.estimated_count ? `<p>Estimated count: ${sighting.estimated_count}</p>` : "") +
+          (damage_notes ? `<p>${damage_notes}</p>` : "") +
+          `<p>Log in to The Muster to view the property and request a booking.</p>`
+      );
+
+      db.prepare(`SELECT * FROM push_subscriptions WHERE owner_role = 'hunter' AND owner_id = ?`)
+        .all(h.id)
+        .forEach((sub) => sendPush(sub, payload));
+    });
+
+    dispatchedHunterCount = nearbyHunters.length;
+  }
+
+  res.status(201).json({ ...sighting, dispatched_hunter_count: dispatchedHunterCount });
+});
+
+// GET /api/sightings/dispatched — hunter only. In-app fallback list of
+// urgent sightings dispatched to this hunter (push/email delivery isn't
+// guaranteed), most recent first.
+app.get("/api/sightings/dispatched", requireAuth("hunter"), (req, res) => {
+  res.json(
+    db.prepare(`
+      SELECT sd.id AS dispatch_id, sd.distance_km, sd.created_at AS dispatched_at,
+             s.id AS sighting_id, s.species, s.estimated_count, s.damage_notes, s.reported_date,
+             p.name AS property_name, p.suburb AS property_suburb
+      FROM sighting_dispatches sd
+      JOIN sightings s ON s.id = sd.sighting_id
+      JOIN properties p ON p.id = s.property_id
+      WHERE sd.hunter_id = ?
+      ORDER BY sd.created_at DESC
+      LIMIT 20
+    `).all(req.user.id)
+  );
 });
 
 // GET /api/properties/:id/regional-pressure — owner only. Aggregates

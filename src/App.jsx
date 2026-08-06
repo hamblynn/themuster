@@ -504,6 +504,7 @@ function PropertyMap({ property, onSightingAdded }) {
   const [urgent, setUrgent] = useState(false);
   const [submittingSighting, setSubmittingSighting] = useState(false);
   const [sightingError, setSightingError] = useState(null);
+  const [dispatchNotice, setDispatchNotice] = useState(null);
 
   function submitSighting() {
     setSubmittingSighting(true);
@@ -528,6 +529,7 @@ function PropertyMap({ property, onSightingAdded }) {
         setDamageNotes("");
         setUrgent(false);
         setEstimatedCount("1");
+        setDispatchNotice(sighting.urgent ? sighting.dispatched_hunter_count : null);
       })
       .catch((e) => setSightingError(e.message))
       .finally(() => setSubmittingSighting(false));
@@ -726,9 +728,25 @@ function PropertyMap({ property, onSightingAdded }) {
             </div>
           </div>
         ) : (
-          <GhostButton icon={AlertTriangle} full onClick={() => setReportOpen(true)}>
-            Report a sighting
-          </GhostButton>
+          <>
+            {dispatchNotice != null && (
+              <div style={{ ...fontBody, fontSize: 12, color: C.eucalyptDeep, marginBottom: 8 }}>
+                {dispatchNotice > 0
+                  ? `Urgent sighting saved — ${dispatchNotice} hunter${dispatchNotice === 1 ? "" : "s"} nearby notified.`
+                  : "Urgent sighting saved — no available hunters within range to notify."}
+              </div>
+            )}
+            <GhostButton
+              icon={AlertTriangle}
+              full
+              onClick={() => {
+                setDispatchNotice(null);
+                setReportOpen(true);
+              }}
+            >
+              Report a sighting
+            </GhostButton>
+          </>
         )}
       </div>
     </div>
@@ -2241,6 +2259,49 @@ function BookingCalendar({ bookings, getLabel, weatherLocation }) {
    past bookings. The other side of BookingRequest: a farmer
    sends a request, this is where the hunter responds to it.
 --------------------------------------------------------- */
+// In-app fallback for urgent-sighting dispatches — push/email delivery
+// isn't guaranteed (and on this test site, email is redirected to one
+// inbox rather than the hunter's own), so this is the one place a
+// hunter is guaranteed to see what they were notified about.
+function UrgentSightingsBanner() {
+  const { user } = useAuth();
+  const [dispatches, setDispatches] = useState([]);
+
+  React.useEffect(() => {
+    if (!user || user.role !== "hunter") {
+      setDispatches([]);
+      return;
+    }
+    apiFetch("/sightings/dispatched")
+      .then((r) => (r.ok ? r.json() : []))
+      .then(setDispatches)
+      .catch(() => {});
+  }, [user?.id, user?.role]);
+
+  if (dispatches.length === 0) return null;
+
+  return (
+    <div style={{ background: C.paperDim, borderRadius: 10, padding: 12, marginBottom: 16 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>
+        <Siren size={13} color={C.rust} />
+        <span style={{ ...fontBody, fontWeight: 600, fontSize: 12.5, color: C.charcoal }}>
+          Urgent sightings near you
+        </span>
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        {dispatches.map((d) => (
+          <div key={d.dispatch_id} style={{ ...fontBody, fontSize: 12, color: C.bark }}>
+            <strong>{d.species || "Unspecified"}</strong>
+            {d.estimated_count ? ` × ${d.estimated_count}` : ""} at {d.property_name}
+            {d.property_suburb ? `, ${d.property_suburb}` : ""} — {d.distance_km.toFixed(1)}km away
+            {d.damage_notes ? ` (${d.damage_notes})` : ""}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function HunterBookings({ goMessages, goLiveTracker }) {
   const { user } = useAuth();
   const [bookings, setBookings] = useState([]);
@@ -2335,6 +2396,8 @@ function HunterBookings({ goMessages, goLiveTracker }) {
       </div>
 
       <Divider />
+
+      <UrgentSightingsBanner />
 
       {error && (
         <div style={{ ...fontBody, fontSize: 12.5, color: C.rust, marginBottom: 10 }}>{error}</div>

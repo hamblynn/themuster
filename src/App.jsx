@@ -1930,6 +1930,35 @@ const BOOKING_STATUS_COLORS = {
 };
 const WEEKDAY_HEADERS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
+// Pure calculation from a known reference new moon — no API, no
+// library, works for any date past or future. Handy context for a
+// hunter (moon brightness affects nocturnal activity/spotlighting).
+const MOON_PHASE_EMOJI = ["🌑", "🌒", "🌓", "🌔", "🌕", "🌖", "🌗", "🌘"];
+function moonPhaseEmoji(dateStr) {
+  const knownNewMoonMs = Date.UTC(2000, 0, 6, 18, 14, 0);
+  const synodicMonthDays = 29.530588853;
+  const noonUtc = new Date(`${dateStr}T12:00:00Z`).getTime();
+  const daysSince = (noonUtc - knownNewMoonMs) / 86400000;
+  const fraction = (((daysSince % synodicMonthDays) + synodicMonthDays) % synodicMonthDays) / synodicMonthDays;
+  return MOON_PHASE_EMOJI[Math.round(fraction * 8) % 8];
+}
+
+// WMO weather codes (used by Open-Meteo, and the wider met industry),
+// collapsed to one emoji each — see https://open-meteo.com/en/docs
+function weatherEmojiForCode(code) {
+  if (code === 0) return "☀️";
+  if (code <= 2) return "🌤️";
+  if (code === 3) return "☁️";
+  if (code === 45 || code === 48) return "🌫️";
+  if (code >= 51 && code <= 57) return "🌦️";
+  if (code >= 61 && code <= 67) return "🌧️";
+  if (code >= 71 && code <= 77) return "🌨️";
+  if (code >= 80 && code <= 82) return "🌦️";
+  if (code >= 85 && code <= 86) return "🌨️";
+  if (code >= 95) return "⛈️";
+  return null;
+}
+
 function ViewModeToggle({ viewMode, onChange }) {
   return (
     <div style={{ display: "flex", gap: 4, background: C.paperDim, borderRadius: 8, padding: 3 }}>
@@ -1963,14 +1992,40 @@ function ViewModeToggle({ viewMode, onChange }) {
   );
 }
 
-function BookingCalendar({ bookings, getLabel }) {
+function BookingCalendar({ bookings, getLabel, weatherLocation }) {
   const today = new Date();
   const [view, setView] = useState({ year: today.getFullYear(), month: today.getMonth() });
+  const [weatherByDate, setWeatherByDate] = useState({});
 
   const byDate = {};
   bookings.forEach((b) => {
     (byDate[b.requested_date] = byDate[b.requested_date] || []).push(b);
   });
+
+  // Open-Meteo needs no API key and is CORS-enabled for direct browser
+  // use — only real forecasts (~16 days out) come back; anything
+  // outside that window just has no weather entry, which is fine, the
+  // moon phase still shows for every day regardless.
+  React.useEffect(() => {
+    if (!weatherLocation?.latitude || !weatherLocation?.longitude) return;
+    fetch(
+      `https://api.open-meteo.com/v1/forecast?latitude=${weatherLocation.latitude}&longitude=${weatherLocation.longitude}&daily=weathercode,temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=16`
+    )
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (!data?.daily?.time) return;
+        const map = {};
+        data.daily.time.forEach((dateStr, i) => {
+          map[dateStr] = {
+            code: data.daily.weathercode[i],
+            max: data.daily.temperature_2m_max[i],
+            min: data.daily.temperature_2m_min[i],
+          };
+        });
+        setWeatherByDate(map);
+      })
+      .catch(() => {});
+  }, [weatherLocation?.latitude, weatherLocation?.longitude]);
 
   const daysInMonth = new Date(view.year, view.month + 1, 0).getDate();
   const leadingBlanks = (new Date(view.year, view.month, 1).getDay() + 6) % 7; // Mon-first grid
@@ -2019,6 +2074,8 @@ function BookingCalendar({ bookings, getLabel }) {
           if (day === null) return <div key={i} />;
           const dateStr = `${view.year}-${String(view.month + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
           const dayBookings = byDate[dateStr] || [];
+          const dayWeather = weatherByDate[dateStr];
+          const weatherEmoji = dayWeather ? weatherEmojiForCode(dayWeather.code) : null;
           return (
             <div
               key={i}
@@ -2030,7 +2087,20 @@ function BookingCalendar({ bookings, getLabel }) {
                 background: dayBookings.length ? C.white : "transparent",
               }}
             >
-              <div style={{ ...fontMono, fontSize: 9, color: C.steel }}>{day}</div>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <span style={{ ...fontMono, fontSize: 9, color: C.steel }}>{day}</span>
+                <span
+                  style={{ fontSize: 9, lineHeight: 1 }}
+                  title={
+                    dayWeather
+                      ? `${Math.round(dayWeather.min)}–${Math.round(dayWeather.max)}°C`
+                      : undefined
+                  }
+                >
+                  {weatherEmoji}
+                  {moonPhaseEmoji(dateStr)}
+                </span>
+              </div>
               {dayBookings.slice(0, 2).map((b) => (
                 <div
                   key={b.id}
@@ -2067,6 +2137,9 @@ function BookingCalendar({ bookings, getLabel }) {
           </div>
         ))}
       </div>
+      <div style={{ ...fontMono, fontSize: 9, color: C.steel, marginTop: 8 }}>
+        Moon phase shown for every day · weather forecast where available (next 16 days)
+      </div>
     </div>
   );
 }
@@ -2082,7 +2155,7 @@ function HunterBookings({ goMessages, goLiveTracker }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [actingId, setActingId] = useState(null);
-  const [viewMode, setViewMode] = useState("list");
+  const [viewMode, setViewMode] = useState("calendar");
 
   function loadBookings() {
     setLoading(true);
@@ -2180,7 +2253,11 @@ function HunterBookings({ goMessages, goLiveTracker }) {
       )}
 
       {viewMode === "calendar" && bookings.length > 0 && (
-        <BookingCalendar bookings={bookings} getLabel={(b) => b.farmer_name} />
+        <BookingCalendar
+          bookings={bookings}
+          getLabel={(b) => b.farmer_name}
+          weatherLocation={{ latitude: user?.latitude, longitude: user?.longitude }}
+        />
       )}
 
       {viewMode === "list" && pending.length > 0 && (
@@ -2834,7 +2911,7 @@ function FarmerBookings({ goMessages, goTrackingView }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [actingId, setActingId] = useState(null);
-  const [viewMode, setViewMode] = useState("list");
+  const [viewMode, setViewMode] = useState("calendar");
 
   function loadBookings() {
     setLoading(true);
@@ -2929,7 +3006,14 @@ function FarmerBookings({ goMessages, goTrackingView }) {
       )}
 
       {viewMode === "calendar" && bookings.length > 0 && (
-        <BookingCalendar bookings={bookings} getLabel={(b) => b.hunter_name} />
+        <BookingCalendar
+          bookings={bookings}
+          getLabel={(b) => b.hunter_name}
+          weatherLocation={{
+            latitude: user?.properties?.[0]?.latitude,
+            longitude: user?.properties?.[0]?.longitude,
+          }}
+        />
       )}
 
       {viewMode === "list" && (

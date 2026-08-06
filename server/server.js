@@ -5,6 +5,7 @@ const Database = require("better-sqlite3");
 const path = require("path");
 const fs = require("fs");
 const webPush = require("web-push");
+const { Resend } = require("resend");
 const {
   hashPassword, verifyPassword, requireAuth, requireAdminAuth,
   setSessionCookie, clearSessionCookie, setAdminSessionCookie, clearAdminSessionCookie,
@@ -20,6 +21,35 @@ webPush.setVapidDetails(
   process.env.VAPID_PUBLIC_KEY || "BCBd5HYiBZJjCBdFLjQm11ceAagJ8Kj3SwfQyFsElJ5KIO2TfCpRFIJ6uXenRDsp6l8Rf07oipABXYFHE5Vty-I",
   process.env.VAPID_PRIVATE_KEY || "mWhwd2hZRRqHqb8tKIc2_FLzbpevBy9mXfcSSUyee-U"
 );
+
+// Unlike VAPID, this IS a real secret (billing-linked) — no fallback
+// baked in. If it's not set, sendEmail() below just skips sending and
+// logs a warning rather than crashing anything.
+const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
+const RESEND_FROM_EMAIL = process.env.RESEND_FROM_EMAIL || "The Muster <onboarding@resend.dev>";
+// This is a mockup — every farmer/hunter email in the seed data
+// (nathan@example.com etc.) is fake and can't receive real mail, so
+// every outgoing notification is redirected to one real inbox instead
+// of the account's actual (fake) login email. Swap this for the
+// account's own email once this stops being a test site.
+const TEST_SITE_EMAIL_OVERRIDE = process.env.TEST_SITE_EMAIL_OVERRIDE || "hamblynn@gmail.com";
+
+async function sendEmail(subject, html) {
+  if (!resend) {
+    console.warn("RESEND_API_KEY not set — skipping email:", subject);
+    return;
+  }
+  try {
+    await resend.emails.send({
+      from: RESEND_FROM_EMAIL,
+      to: TEST_SITE_EMAIL_OVERRIDE,
+      subject,
+      html,
+    });
+  } catch (e) {
+    console.error("Email send failed:", e.message);
+  }
+}
 
 const dbPath = path.join(__dirname, "muster.db");
 if (!fs.existsSync(dbPath)) {
@@ -989,7 +1019,7 @@ app.post("/api/bookings", requireAuth("farmer"), (req, res) => {
   if (!property_id || !hunter_id || !requested_date) {
     return res.status(400).json({ error: "property_id, hunter_id and requested_date are required" });
   }
-  const property = db.prepare(`SELECT farmer_id FROM properties WHERE id = ?`).get(property_id);
+  const property = db.prepare(`SELECT farmer_id, name FROM properties WHERE id = ?`).get(property_id);
   if (!property || property.farmer_id !== req.user.id) {
     return res.status(403).json({ error: "You can only book on your own properties" });
   }
@@ -1010,6 +1040,15 @@ app.post("/api/bookings", requireAuth("farmer"), (req, res) => {
     .run(property_id, hunter_id, requested_date, start_time || null, end_time || null, farmer_note || null);
 
   const booking = db.prepare(`SELECT * FROM bookings WHERE id = ?`).get(result.lastInsertRowid);
+
+  const farmer = db.prepare(`SELECT name FROM farmers WHERE id = ?`).get(req.user.id);
+  sendEmail(
+    `New booking request — ${property.name}, ${requested_date}`,
+    `<p><strong>${farmer.name}</strong> requested you (${hunter.name}) for <strong>${property.name}</strong> on ${requested_date}${start_time && end_time ? ` (${start_time}–${end_time})` : ""}.</p>` +
+      (farmer_note ? `<p>Note: ${farmer_note}</p>` : "") +
+      `<p>Log in to The Muster to accept or decline.</p>`
+  );
+
   res.status(201).json(booking);
 });
 
@@ -1162,6 +1201,19 @@ app.patch("/api/bookings/:id", requireAuth(), (req, res) => {
 
   db.prepare(`UPDATE bookings SET status = ?, updated_at = datetime('now') WHERE id = ?`)
     .run(status, req.params.id);
+
+  // Tell the farmer what happened to their request — the hunter already
+  // knows, they're the one who just clicked Accept/Decline.
+  if (req.user.role === "hunter" && (status === "approved" || status === "declined")) {
+    const property = db.prepare(`SELECT name FROM properties WHERE id = ?`).get(booking.property_id);
+    const hunter = db.prepare(`SELECT name FROM hunters WHERE id = ?`).get(booking.hunter_id);
+    sendEmail(
+      `Booking ${status} — ${property.name}, ${booking.requested_date}`,
+      `<p><strong>${hunter.name}</strong> ${status} your booking request for <strong>${property.name}</strong> on ${booking.requested_date}.</p>` +
+        `<p>Log in to The Muster for details.</p>`
+    );
+  }
+
   res.json(db.prepare(`SELECT * FROM bookings WHERE id = ?`).get(req.params.id));
 });
 

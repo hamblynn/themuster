@@ -34,7 +34,7 @@ const RESEND_FROM_EMAIL = process.env.RESEND_FROM_EMAIL || "The Muster <onboardi
 // account's own email once this stops being a test site.
 const TEST_SITE_EMAIL_OVERRIDE = process.env.TEST_SITE_EMAIL_OVERRIDE || "hamblynn@gmail.com";
 
-async function sendEmail(subject, html) {
+async function sendEmail(subject, html, attachments) {
   if (!resend) {
     console.warn("RESEND_API_KEY not set — skipping email:", subject);
     return;
@@ -45,6 +45,7 @@ async function sendEmail(subject, html) {
       to: TEST_SITE_EMAIL_OVERRIDE,
       subject,
       html,
+      ...(attachments ? { attachments } : {}),
     });
   } catch (e) {
     console.error("Email send failed:", e.message);
@@ -537,14 +538,34 @@ app.delete("/api/admin/species/:id", requireAdminAuth, (req, res) => {
 // before /api/properties/:id below — Express matches routes in
 // registration order and :id matches any string including "browse",
 // so this must come first or that catch-all swallows it.
+// ?near_property_id=<id> anchors distance on that property's own location
+// instead of the requesting hunter's — used for "nearby farms" suggestions
+// right after a booking, rather than "farms near me". The anchor property
+// itself is excluded from the results (suggesting the farm just booked
+// back to the hunter isn't useful). Paused listings (active=0) never show.
 app.get("/api/properties/browse", requireAuth("hunter"), (req, res) => {
-  const hunter = db.prepare(`SELECT * FROM hunters WHERE id = ?`).get(req.user.id);
-  const properties = db.prepare(`SELECT * FROM properties`).all();
+  let anchorLat, anchorLon, excludeId;
+  if (req.query.near_property_id) {
+    const anchorProperty = db.prepare(`SELECT * FROM properties WHERE id = ?`).get(req.query.near_property_id);
+    if (anchorProperty) {
+      anchorLat = anchorProperty.latitude;
+      anchorLon = anchorProperty.longitude;
+      excludeId = anchorProperty.id;
+    }
+  }
+  if (anchorLat == null) {
+    const hunter = db.prepare(`SELECT * FROM hunters WHERE id = ?`).get(req.user.id);
+    anchorLat = hunter.latitude;
+    anchorLon = hunter.longitude;
+  }
+
+  const properties = db.prepare(`SELECT * FROM properties WHERE active = 1`).all();
 
   const results = properties
+    .filter((p) => p.id !== excludeId)
     .map((p) => ({
       ...publicPropertyView(p, req.user.id),
-      distance_km: Math.round(distanceKm(hunter.latitude, hunter.longitude, p.latitude, p.longitude) * 10) / 10,
+      distance_km: Math.round(distanceKm(anchorLat, anchorLon, p.latitude, p.longitude) * 10) / 10,
     }))
     .sort((a, b) => a.distance_km - b.distance_km);
 
@@ -859,13 +880,13 @@ app.patch("/api/properties/:id", requireAuth("farmer"), (req, res) => {
     "name", "pic_code", "lot_number", "plan_number", "address", "suburb",
     "latitude", "longitude", "size_hectares", "access_notes",
     "permitted_hours", "allow_spotlighting", "geofence_radius_m", "ownership_document_url",
-    "exclusivity_mode",
+    "exclusivity_mode", "active",
   ];
   const updates = {};
   editable.forEach((field) => {
     if (req.body[field] !== undefined) {
       updates[field] =
-        field === "allow_spotlighting"
+        field === "allow_spotlighting" || field === "active"
           ? (req.body[field] ? 1 : 0)
           : field === "geofence_radius_m"
           ? parseInt(req.body[field], 10) || 1000
@@ -1935,14 +1956,11 @@ app.post("/api/tracking/:sessionId/tags", requireAuth("hunter"), (req, res) => {
   res.status(201).json(db.prepare(`SELECT * FROM track_tags WHERE id = ?`).get(result.lastInsertRowid));
 });
 
-// GET /api/tracking/:sessionId — owner hunter, or the farmer who owns
-// the booking's property AND (share_with_farmer=1 OR there's an
-// unresolved SOS — safety overrides the privacy default).
-app.get("/api/tracking/:sessionId", requireAuth(), (req, res) => {
-  const session = db.prepare(`SELECT * FROM tracking_sessions WHERE id = ?`).get(req.params.sessionId);
-  if (!session) return res.status(404).json({ error: "Tracking session not found" });
-  const booking = db.prepare(`SELECT * FROM bookings WHERE id = ?`).get(session.booking_id);
-
+// Shared by GET /api/tracking/:sessionId and the KML export/email routes
+// below — owner hunter, or the farmer who owns the booking's property
+// AND (share_with_farmer=1 OR there's an unresolved SOS — safety
+// overrides the privacy default).
+function canAccessTrackingSession(req, session, booking) {
   const isOwnerHunter = req.user.role === "hunter" && session.hunter_id === req.user.id;
   let isFarmerAllowed = false;
   if (req.user.role === "farmer") {
@@ -1953,14 +1971,113 @@ app.get("/api/tracking/:sessionId", requireAuth(), (req, res) => {
       .get(session.id);
     isFarmerAllowed = ownsProperty && (!!session.share_with_farmer || hasUnresolvedSos);
   }
-  if (!isOwnerHunter && !isFarmerAllowed) {
+  return isOwnerHunter || isFarmerAllowed;
+}
+
+function escapeXml(str) {
+  return String(str ?? "").replace(/[<>&'"]/g, (c) => ({
+    "<": "&lt;", ">": "&gt;", "&": "&amp;", "'": "&apos;", '"': "&quot;",
+  }[c]));
+}
+
+// KML coordinates are lon,lat — the opposite order from lat,lon used
+// everywhere else in this app. Easy to invert, so get it right here.
+function buildTrackKml(session, points, tags, propertyName) {
+  const trackName = `Track — ${propertyName || "Muster"}`;
+  const lineCoords = points.map((p) => `${p.longitude},${p.latitude},0`).join(" ");
+  const tagPlacemarks = tags
+    .map(
+      (t) => `  <Placemark>
+    <name>${escapeXml(t.tag_type)}</name>
+    ${t.notes ? `<description>${escapeXml(t.notes)}</description>` : ""}
+    <Point><coordinates>${t.longitude},${t.latitude},0</coordinates></Point>
+  </Placemark>`
+    )
+    .join("\n");
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+<Document>
+  <name>${escapeXml(trackName)}</name>
+  <Placemark>
+    <name>Track</name>
+    <LineString>
+      <tessellate>1</tessellate>
+      <coordinates>${lineCoords}</coordinates>
+    </LineString>
+  </Placemark>
+${tagPlacemarks}
+</Document>
+</kml>`;
+}
+
+// GET /api/tracking/:sessionId — owner hunter, or the farmer who owns
+// the booking's property AND (share_with_farmer=1 OR there's an
+// unresolved SOS — safety overrides the privacy default).
+app.get("/api/tracking/:sessionId", requireAuth(), (req, res) => {
+  const session = db.prepare(`SELECT * FROM tracking_sessions WHERE id = ?`).get(req.params.sessionId);
+  if (!session) return res.status(404).json({ error: "Tracking session not found" });
+  const booking = db.prepare(`SELECT * FROM bookings WHERE id = ?`).get(session.booking_id);
+
+  if (!canAccessTrackingSession(req, session, booking)) {
     return res.status(403).json({ error: "You don't have access to this tracking session" });
   }
 
   session.geofence_required = booking.geofence_required;
+  session.hunter_name = db.prepare(`SELECT name FROM hunters WHERE id = ?`).get(session.hunter_id)?.name;
   session.points = db.prepare(`SELECT * FROM track_points WHERE session_id = ? ORDER BY recorded_at`).all(session.id);
   session.tags = db.prepare(`SELECT * FROM track_tags WHERE session_id = ? ORDER BY recorded_at`).all(session.id);
   res.json(session);
+});
+
+// GET /api/tracking/:sessionId/kml — direct browser download. A plain
+// <a href=... download> link works for this without any fetch/blob
+// juggling, since cookies ride along on a normal top-level GET.
+app.get("/api/tracking/:sessionId/kml", requireAuth(), (req, res) => {
+  const session = db.prepare(`SELECT * FROM tracking_sessions WHERE id = ?`).get(req.params.sessionId);
+  if (!session) return res.status(404).json({ error: "Tracking session not found" });
+  const booking = db.prepare(`SELECT * FROM bookings WHERE id = ?`).get(session.booking_id);
+  if (!canAccessTrackingSession(req, session, booking)) {
+    return res.status(403).json({ error: "You don't have access to this tracking session" });
+  }
+
+  const points = db.prepare(`SELECT * FROM track_points WHERE session_id = ? ORDER BY recorded_at`).all(session.id);
+  if (points.length === 0) {
+    return res.status(400).json({ error: "This track has no points to export" });
+  }
+  const tags = db.prepare(`SELECT * FROM track_tags WHERE session_id = ? ORDER BY recorded_at`).all(session.id);
+  const property = booking && db.prepare(`SELECT name FROM properties WHERE id = ?`).get(booking.property_id);
+
+  const kml = buildTrackKml(session, points, tags, property?.name);
+  res.setHeader("Content-Type", "application/vnd.google-earth.kml+xml");
+  res.setHeader("Content-Disposition", `attachment; filename="track-${session.id}.kml"`);
+  res.send(kml);
+});
+
+// POST /api/tracking/:sessionId/kml/email — same access rule, emails the
+// KML as an attachment (redirected to TEST_SITE_EMAIL_OVERRIDE like every
+// other email on this test site).
+app.post("/api/tracking/:sessionId/kml/email", requireAuth(), async (req, res) => {
+  const session = db.prepare(`SELECT * FROM tracking_sessions WHERE id = ?`).get(req.params.sessionId);
+  if (!session) return res.status(404).json({ error: "Tracking session not found" });
+  const booking = db.prepare(`SELECT * FROM bookings WHERE id = ?`).get(session.booking_id);
+  if (!canAccessTrackingSession(req, session, booking)) {
+    return res.status(403).json({ error: "You don't have access to this tracking session" });
+  }
+
+  const points = db.prepare(`SELECT * FROM track_points WHERE session_id = ? ORDER BY recorded_at`).all(session.id);
+  if (points.length === 0) {
+    return res.status(400).json({ error: "This track has no points to export" });
+  }
+  const tags = db.prepare(`SELECT * FROM track_tags WHERE session_id = ? ORDER BY recorded_at`).all(session.id);
+  const property = booking && db.prepare(`SELECT name FROM properties WHERE id = ?`).get(booking.property_id);
+
+  const kml = buildTrackKml(session, points, tags, property?.name);
+  await sendEmail(
+    `Your track from ${property?.name || "The Muster"}`,
+    `<p>Attached is the KML file for your tracking session${property?.name ? ` at ${escapeXml(property.name)}` : ""}.</p>`,
+    [{ filename: `track-${session.id}.kml`, content: Buffer.from(kml).toString("base64") }]
+  );
+  res.json({ ok: true });
 });
 
 // POST /api/tracking/:sessionId/sos — owner hunter only. Pushes to the

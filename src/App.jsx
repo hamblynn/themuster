@@ -35,6 +35,8 @@ import {
   Navigation,
   Siren,
   Crosshair,
+  Download,
+  Mail,
 } from "lucide-react";
 import { MapContainer, TileLayer, Marker, Polyline, useMap } from "react-leaflet";
 import L from "leaflet";
@@ -1919,6 +1921,65 @@ function BookingRequest({ hunterId, hunterName, goBack, goMessages }) {
    the first screen where hunters discover properties directly rather
    than only reacting to a farmer-initiated booking.
 --------------------------------------------------------- */
+// A single farm listing card — used by BrowseFarms's main list and by
+// the "nearby farms" suggestions on HunterBookingRequest's confirmation
+// screen.
+function FarmCard({ property: p, onClick }) {
+  return (
+    <div
+      onClick={onClick}
+      style={{
+        background: C.white,
+        border: `1px solid ${C.line}`,
+        borderRadius: 12,
+        padding: 14,
+        cursor: "pointer",
+      }}
+    >
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+        <div>
+          <div style={{ ...fontBody, fontWeight: 700, fontSize: 15, color: C.charcoal }}>
+            {p.name}
+            {p.suburb ? `, ${p.suburb}` : ""}
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 5, marginTop: 2 }}>
+            <MapPin size={12} color={C.steel} />
+            <span style={{ ...fontMono, fontSize: 11.5, color: C.steel }}>{p.distance_km} km away</span>
+          </div>
+        </div>
+        <EarTag
+          label="OWNERSHIP"
+          status={
+            p.verification_status === "verified"
+              ? "verified"
+              : p.verification_status === "rejected"
+              ? "missing"
+              : "warning"
+          }
+        />
+      </div>
+      <div style={{ display: "flex", gap: 6, marginTop: 10, flexWrap: "wrap" }}>
+        {p.species.map((s) => (
+          <Pill key={s.species}>{s.label}</Pill>
+        ))}
+      </div>
+      {p.exclusivity_mode === "exclusive" && (
+        <div style={{ marginTop: 10 }}>
+          <Pill tone={p.is_mine || p.pending_request_id ? "gold" : p.exclusively_held ? "rust" : "mist"}>
+            {p.is_mine
+              ? "YOU HOLD THIS"
+              : p.exclusively_held
+              ? "EXCLUSIVE — TAKEN"
+              : p.pending_request_id
+              ? "REQUEST PENDING"
+              : "OPEN FOR EXCLUSIVITY"}
+          </Pill>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function BrowseFarms({ goFarm }) {
   const { user } = useAuth();
   const [properties, setProperties] = useState([]);
@@ -1973,58 +2034,7 @@ function BrowseFarms({ goFarm }) {
 
       <div className="muster-hunter-list">
         {properties.map((p) => (
-          <div
-            key={p.id}
-            onClick={() => goFarm(p.id, p.name)}
-            style={{
-              background: C.white,
-              border: `1px solid ${C.line}`,
-              borderRadius: 12,
-              padding: 14,
-              cursor: "pointer",
-            }}
-          >
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-              <div>
-                <div style={{ ...fontBody, fontWeight: 700, fontSize: 15, color: C.charcoal }}>
-                  {p.name}
-                  {p.suburb ? `, ${p.suburb}` : ""}
-                </div>
-                <div style={{ display: "flex", alignItems: "center", gap: 5, marginTop: 2 }}>
-                  <MapPin size={12} color={C.steel} />
-                  <span style={{ ...fontMono, fontSize: 11.5, color: C.steel }}>{p.distance_km} km away</span>
-                </div>
-              </div>
-              <EarTag
-                label="OWNERSHIP"
-                status={
-                  p.verification_status === "verified"
-                    ? "verified"
-                    : p.verification_status === "rejected"
-                    ? "missing"
-                    : "warning"
-                }
-              />
-            </div>
-            <div style={{ display: "flex", gap: 6, marginTop: 10, flexWrap: "wrap" }}>
-              {p.species.map((s) => (
-                <Pill key={s.species}>{s.label}</Pill>
-              ))}
-            </div>
-            {p.exclusivity_mode === "exclusive" && (
-              <div style={{ marginTop: 10 }}>
-                <Pill tone={p.is_mine || p.pending_request_id ? "gold" : p.exclusively_held ? "rust" : "mist"}>
-                  {p.is_mine
-                    ? "YOU HOLD THIS"
-                    : p.exclusively_held
-                    ? "EXCLUSIVE — TAKEN"
-                    : p.pending_request_id
-                    ? "REQUEST PENDING"
-                    : "OPEN FOR EXCLUSIVITY"}
-                </Pill>
-              </div>
-            )}
-          </div>
+          <FarmCard key={p.id} property={p} onClick={() => goFarm(p.id, p.name)} />
         ))}
       </div>
     </div>
@@ -2254,7 +2264,7 @@ function FarmProfile({ propertyId, goBooking, goBack }) {
    harvest-declaration confirmation copy, myProperty lookup) — only the
    date-row pattern is shared.
 --------------------------------------------------------- */
-function HunterBookingRequest({ propertyId, propertyName, goBack }) {
+function HunterBookingRequest({ propertyId, propertyName, goBack, goFarm }) {
   const { user } = useAuth();
   const dateOptions = nextDates(21);
   const [selectedDate, setSelectedDate] = useState(dateOptions[0]);
@@ -2262,6 +2272,16 @@ function HunterBookingRequest({ propertyId, propertyName, goBack }) {
   const [booking, setBooking] = useState(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState(null);
+  const [nearbyFarms, setNearbyFarms] = useState([]);
+
+  React.useEffect(() => {
+    if (!booking) return;
+    apiFetch(`/properties/browse?near_property_id=${propertyId}`)
+      .then((r) => (r.ok ? r.json() : []))
+      .then((data) => setNearbyFarms((data || []).slice(0, 3)))
+      .catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [booking]);
 
   React.useEffect(() => {
     if (!user || isHunterAvailableOn(user, selectedDate)) return;
@@ -2312,6 +2332,21 @@ function HunterBookingRequest({ propertyId, propertyName, goBack }) {
           You requested {propertyName} on {formatShortDate(booking.requested_date)}. Status: {booking.status}.
           The farmer will accept or decline it from their bookings list.
         </div>
+
+        {nearbyFarms.length > 0 && (
+          <>
+            <Divider />
+            <div style={{ ...fontBody, fontWeight: 700, fontSize: 14, color: C.charcoal, marginBottom: 10 }}>
+              Nearby farms you might also want to book
+            </div>
+            <div className="muster-hunter-list">
+              {nearbyFarms.map((p) => (
+                <FarmCard key={p.id} property={p} onClick={() => goFarm && goFarm(p.id, p.name)} />
+              ))}
+            </div>
+          </>
+        )}
+
         <Divider />
         <GhostButton full onClick={goBack}>
           Back to farm
@@ -3265,6 +3300,61 @@ const SOS_HOLD_MS = 2000;
    approved booking in HunterBookings; session start/stop is the
    check-in/check-out record.
 --------------------------------------------------------- */
+// Download link + "email this track" button shared by LiveTracker's own
+// ended-state view and the farmer's read-only TrackingLiveView — both
+// just hit the same two KML routes, only the email button's label differs.
+function TrackKmlActions({ sessionId, emailLabel }) {
+  const [emailing, setEmailing] = useState(false);
+  const [emailed, setEmailed] = useState(false);
+  const [error, setError] = useState(null);
+
+  function emailTrack() {
+    setEmailing(true);
+    setError(null);
+    apiFetch(`/tracking/${sessionId}/kml/email`, { method: "POST" })
+      .then((r) => {
+        if (!r.ok) return r.json().then((e) => Promise.reject(new Error(e.error)));
+        setEmailed(true);
+      })
+      .catch((e) => setError(e.message))
+      .finally(() => setEmailing(false));
+  }
+
+  return (
+    <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "center", gap: 8, marginTop: 4 }}>
+      <a
+        href={`${API_BASE}/tracking/${sessionId}/kml`}
+        download
+        style={{
+          display: "inline-flex",
+          alignItems: "center",
+          justifyContent: "center",
+          gap: 8,
+          background: "transparent",
+          color: C.charcoal,
+          border: `1.5px solid ${C.line}`,
+          borderRadius: 8,
+          padding: "9px 16px",
+          ...fontBody,
+          fontWeight: 600,
+          fontSize: 13.5,
+          textDecoration: "none",
+        }}
+      >
+        <Download size={15} /> Download KML
+      </a>
+      <GhostButton icon={Mail} onClick={emailTrack}>
+        {emailing ? "Sending…" : emailed ? "Sent!" : emailLabel}
+      </GhostButton>
+      {error && (
+        <div style={{ ...fontBody, fontSize: 11.5, color: C.rust, width: "100%", textAlign: "center" }}>
+          {error}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function LiveTracker({ booking, goBack }) {
   const activeFromBooking =
     booking?.tracking_session && !booking.tracking_session.ended_at ? booking.tracking_session : null;
@@ -3618,6 +3708,7 @@ function LiveTracker({ booking, goBack }) {
             <div style={{ ...fontBody, fontSize: 12.5, color: C.steel, textAlign: "center", padding: "12px 0" }}>
               Tracking ended. {tags.length} tag{tags.length === 1 ? "" : "s"} recorded.
             </div>
+            <TrackKmlActions sessionId={session.id} emailLabel="Email me this track" />
           </>
         )}
       </div>
@@ -3836,6 +3927,12 @@ function TrackingLiveView({ sessionId, goBack }) {
               ? `Tracking ended ${session.ended_at}.`
               : "Live now — updates every 20 seconds while this page is open."}
           </div>
+          {session.ended_at && (
+            <TrackKmlActions
+              sessionId={session.id}
+              emailLabel={`Email ${session.hunter_name ? session.hunter_name.split(" ")[0] : "the hunter"} this track`}
+            />
+          )}
           <GeofenceStatus booking={{ geofence_required: session.geofence_required, tracking_session: session }} />
           <div style={{ borderRadius: 12, overflow: "hidden", border: `1px solid ${C.line}`, marginTop: 8 }}>
             <MapContainer
@@ -4336,6 +4433,7 @@ function EditProperty({ goBack, onSaved }) {
   const [accessNotes, setAccessNotes] = useState("");
   const [permittedHours, setPermittedHours] = useState("");
   const [allowSpotlighting, setAllowSpotlighting] = useState(false);
+  const [active, setActive] = useState(true);
   const [geofenceRadiusM, setGeofenceRadiusM] = useState("1000");
   const [ownershipDocumentUrl, setOwnershipDocumentUrl] = useState("");
   const [verificationStatus, setVerificationStatus] = useState("pending");
@@ -4393,6 +4491,7 @@ function EditProperty({ goBack, onSaved }) {
         setAccessNotes(p.access_notes || "");
         setPermittedHours(p.permitted_hours || "");
         setAllowSpotlighting(!!p.allow_spotlighting);
+        setActive(!!p.active);
         setGeofenceRadiusM(p.geofence_radius_m != null ? String(p.geofence_radius_m) : "1000");
         setOwnershipDocumentUrl(p.ownership_document_url || "");
         setVerificationStatus(p.verification_status || "pending");
@@ -4510,6 +4609,7 @@ function EditProperty({ goBack, onSaved }) {
         access_notes: accessNotes,
         permitted_hours: permittedHours,
         allow_spotlighting: allowSpotlighting,
+        active,
         geofence_radius_m: parseInt(geofenceRadiusM, 10) || 1000,
         ownership_document_url: ownershipDocumentUrl,
         exclusivity_mode: exclusivityMode,
@@ -4638,6 +4738,11 @@ function EditProperty({ goBack, onSaved }) {
           label="Spotlighting permitted at night"
           checked={allowSpotlighting}
           onChange={setAllowSpotlighting}
+        />
+        <Checkbox
+          label="Property is active — visible to hunters in matches and Browse farms"
+          checked={active}
+          onChange={setActive}
         />
         <TextField
           label="CHECK-IN RADIUS (METRES)"
@@ -6748,6 +6853,7 @@ function AppShell() {
               propertyId={selectedPropertyId}
               propertyName={selectedPropertyName || "this farm"}
               goBack={() => setScreen("farmProfile")}
+              goFarm={openFarm}
             />
           )}
           {screen === "hunterCredentials" && <HunterCredentials />}

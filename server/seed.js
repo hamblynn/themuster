@@ -203,6 +203,99 @@ db.prepare(`
 db.prepare(`UPDATE hunters SET rating_avg = 4.7, rating_count = 12 WHERE id = ?`).run(hunterIds[1]);
 db.prepare(`UPDATE hunters SET rating_avg = 5.0, rating_count = 34 WHERE id = ?`).run(hunterIds[2]);
 
+// ============================================================
+// NATHAN'S OTHER TWO PROPERTIES — so the multi-property farmer UI
+// (property switcher, "+ Add another property") has real data out of
+// the box, not just a manually-added test property. Two different
+// hunters each hold exclusive access to one of these (Jess on Howqua,
+// Dale on Jamieson Flats) — Riverbend stays 'shared', matching its
+// existing Tom Riordan review/relationship. Riverbend and Howqua get
+// a handful of ordinary farmer-initiated bookings across several
+// hunters/statuses; Jamieson Flats gets several hunter-initiated
+// bookings, all from Dale since only the exclusive holder can create
+// those.
+// ============================================================
+const insertExclusivityRequest = db.prepare(`
+  INSERT INTO exclusivity_requests (property_id, hunter_id, status, decided_at)
+  VALUES (?, ?, 'approved', datetime('now'))
+`);
+function grantExclusivity(propertyId, hunterId) {
+  insertExclusivityRequest.run(propertyId, hunterId);
+  db.prepare(`UPDATE properties SET exclusivity_mode = 'exclusive', exclusive_hunter_id = ? WHERE id = ?`)
+    .run(hunterId, propertyId);
+}
+
+const howquaId = insertProperty.run({
+  farmer_id: farmerId,
+  name: "Howqua Block",
+  pic_code: "3TR00413",
+  lot_number: null,
+  plan_number: null,
+  address: "88 Howqua Track",
+  suburb: "Howqua",
+  latitude: -37.15,
+  longitude: 146.22,
+  size_hectares: 280,
+  access_notes: "River crossing impassable after heavy rain — call ahead.",
+  permitted_hours: "05:30-09:00,16:00-dusk",
+  allow_spotlighting: 0,
+}).lastInsertRowid;
+[
+  { species: "deer", other_description: null, atcw_document_url: null, atcw_remaining_quantity: null, atcw_expiry_date: null },
+  { species: "fox", other_description: null, atcw_document_url: null, atcw_remaining_quantity: null, atcw_expiry_date: null },
+].forEach((s) => insertPropertySpecies.run({ property_id: howquaId, ...s }));
+grantExclusivity(howquaId, hunterIds[1]); // Jess McAllister
+
+const jamiesonId = insertProperty.run({
+  farmer_id: farmerId,
+  name: "Jamieson Flats",
+  pic_code: "3TR00414",
+  lot_number: null,
+  plan_number: null,
+  address: "14 Jamieson-Licola Rd",
+  suburb: "Jamieson",
+  latitude: -37.2833,
+  longitude: 146.1333,
+  size_hectares: 195,
+  access_notes: "Park at the old shearing shed, walk in from there.",
+  permitted_hours: "05:30-09:00,16:00-dusk",
+  allow_spotlighting: 1,
+}).lastInsertRowid;
+[
+  { species: "deer", other_description: null, atcw_document_url: null, atcw_remaining_quantity: null, atcw_expiry_date: null },
+  { species: "wild_dog", other_description: null, atcw_document_url: null, atcw_remaining_quantity: null, atcw_expiry_date: null },
+].forEach((s) => insertPropertySpecies.run({ property_id: jamiesonId, ...s }));
+grantExclusivity(jamiesonId, hunterIds[2]); // Dale Kovac
+
+const insertHunterInitiatedBooking = db.prepare(`
+  INSERT INTO bookings (property_id, hunter_id, requested_date, start_time, end_time, status, farmer_note, initiated_by)
+  VALUES (?, ?, ?, ?, ?, ?, ?, 'hunter')
+`);
+
+// Riverbend — a few more ordinary bookings alongside the existing one.
+[
+  { hunter: hunterIds[1], date: "2026-08-18", status: "requested" },
+  { hunter: hunterIds[2], date: "2026-08-22", status: "approved" },
+  { hunter: hunterIds[0], date: "2026-08-25", status: "completed" },
+].forEach((b) => insertBooking.run(propertyId, b.hunter, b.date, "05:30", "09:00", b.status, null));
+
+// Howqua — mixed hunters, mixed statuses (exclusivity gates who can
+// self-book, not who the farmer can still invite directly).
+[
+  { hunter: hunterIds[2], date: "2026-08-19", status: "requested" },
+  { hunter: hunterIds[0], date: "2026-08-23", status: "approved" },
+  { hunter: hunterIds[1], date: "2026-08-27", status: "completed" },
+].forEach((b) => insertBooking.run(howquaId, b.hunter, b.date, "05:30", "09:00", b.status, null));
+
+// Jamieson Flats — hunter-initiated, all from Dale (the exclusive holder).
+[
+  { date: "2026-08-20", status: "requested" },
+  { date: "2026-08-24", status: "approved" },
+  { date: "2026-08-29", status: "completed" },
+].forEach((b) =>
+  insertHunterInitiatedBooking.run(jamiesonId, hunterIds[2], b.date, "05:30", "09:00", b.status, null)
+);
+
 db.prepare(`
   INSERT INTO referrals (referring_farmer_id, hunter_id, referred_name, referred_contact, referred_property, note, status)
   VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -529,7 +622,10 @@ BUSY_HUNTER_IDS.forEach((hid) => {
 });
 
 console.log(`Seeded ${dbPath}`);
-console.log(`Farmer #${farmerId}, Property #${propertyId}, Hunters: ${hunterIds.join(", ")}`);
+console.log(`Farmer #${farmerId}, Hunters: ${hunterIds.join(", ")}`);
+console.log(
+  `Nathan's properties — Riverbend #${propertyId} (shared), Howqua #${howquaId} (exclusive to Jess McAllister), Jamieson Flats #${jamiesonId} (exclusive to Dale Kovac, hunter-initiated bookings).`
+);
 console.log(`Plus ${bulkFarmerIds.length} bulk farmers, ${bulkHunterIds.length} bulk hunters, and a booking per bulk hunter across ${bulkHunterIds.length} consecutive days from 2026-08-20.`);
 console.log(`Tom Riordan and Jess McAllister are each booked solid for ${BUSY_DAYS} consecutive days from 2026-09-09.`);
 console.log(`Demo logins (password: ${DEMO_PASSWORD}):`);

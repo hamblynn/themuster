@@ -107,6 +107,115 @@ function apiFetch(path, { body, headers, ...rest } = {}) {
   });
 }
 
+// ---------------------------------------------------------
+// OFFLINE QUEUE — for the hunter live-tracker (GPS points, spot tags,
+// SOS) when there's no signal, which is the whole point of a remote
+// property. IndexedDB, not localStorage/memory, because it has to
+// survive a tab reload or the app being backgrounded for hours while
+// a hunter is out of range. A "network failure" (fetch rejects — no
+// connection at all) gets queued for retry; an actual HTTP response
+// that isn't ok (e.g. the session already ended) is a real rejection,
+// not a connectivity problem, so it's dropped rather than retried
+// forever.
+// ---------------------------------------------------------
+const OFFLINE_QUEUE_DB = "muster-offline-queue";
+const OFFLINE_QUEUE_STORE = "items";
+
+function offlineQueueAvailable() {
+  return typeof indexedDB !== "undefined";
+}
+
+function openOfflineQueueDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(OFFLINE_QUEUE_DB, 1);
+    req.onupgradeneeded = () => {
+      req.result.createObjectStore(OFFLINE_QUEUE_STORE, { keyPath: "id", autoIncrement: true });
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function offlineQueueAll() {
+  if (!offlineQueueAvailable()) return [];
+  const db = await openOfflineQueueDB();
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(OFFLINE_QUEUE_STORE, "readonly").objectStore(OFFLINE_QUEUE_STORE).getAll();
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function offlineQueuePut(item) {
+  const db = await openOfflineQueueDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(OFFLINE_QUEUE_STORE, "readwrite");
+    tx.objectStore(OFFLINE_QUEUE_STORE).put(item);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function offlineQueueDelete(id) {
+  const db = await openOfflineQueueDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(OFFLINE_QUEUE_STORE, "readwrite");
+    tx.objectStore(OFFLINE_QUEUE_STORE).delete(id);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+// Points batch harder to keep tidy than a one-off tag/SOS: a hunter out
+// of range for hours would otherwise queue one row per 15s flush
+// attempt. Instead, merge into a single growing per-session row so
+// reconnecting sends one request instead of dozens of tiny ones.
+async function offlineQueueAddPoints(sessionId, points) {
+  if (!offlineQueueAvailable()) return;
+  const existing = (await offlineQueueAll()).find((i) => i.kind === "points" && i.session_id === sessionId);
+  if (existing) {
+    await offlineQueuePut({ ...existing, points: [...existing.points, ...points] });
+  } else {
+    await offlineQueuePut({ kind: "points", session_id: sessionId, points, queued_at: Date.now() });
+  }
+}
+
+async function offlineQueueAddOne(kind, sessionId, body) {
+  if (!offlineQueueAvailable()) return;
+  await offlineQueuePut({ kind, session_id: sessionId, body, queued_at: Date.now() });
+}
+
+// Attempts every queued item once, in queued order. Stops at the first
+// network failure (further items would fail identically — no point
+// hammering all of them) but keeps going past a permanent per-item
+// rejection so one bad item can't block everything behind it.
+// `onFlushed(item)` fires for each item that actually sent.
+async function offlineQueueFlush(onFlushed) {
+  if (!offlineQueueAvailable()) return 0;
+  const items = await offlineQueueAll();
+  for (const item of items) {
+    const path =
+      item.kind === "points"
+        ? `/tracking/${item.session_id}/points`
+        : item.kind === "tag"
+        ? `/tracking/${item.session_id}/tags`
+        : `/tracking/${item.session_id}/sos`;
+    const body = item.kind === "points" ? { points: item.points } : item.body;
+    let response;
+    try {
+      response = await apiFetch(path, { method: "POST", body });
+    } catch {
+      break; // still offline — leave this and everything after it queued
+    }
+    if (response.ok || response.status < 500) {
+      await offlineQueueDelete(item.id);
+      if (response.ok && onFlushed) onFlushed(item);
+    }
+    // a 5xx leaves the item queued to retry next cycle
+  }
+  return (await offlineQueueAll()).length;
+}
+
 function initialsOf(name) {
   return name
     .split(" ")
@@ -2612,6 +2721,8 @@ function LiveTracker({ booking, goBack }) {
   const [noteDraft, setNoteDraft] = useState("");
   const [sosProgress, setSosProgress] = useState(0);
   const [sosSent, setSosSent] = useState(false);
+  const [sosQueued, setSosQueued] = useState(false);
+  const [queueSize, setQueueSize] = useState(0);
 
   const watchIdRef = React.useRef(null);
   const pendingPointsRef = React.useRef([]);
@@ -2619,6 +2730,7 @@ function LiveTracker({ booking, goBack }) {
   const wakeLockRef = React.useRef(null);
   const sosTimerRef = React.useRef(null);
   const sosIntervalRef = React.useRef(null);
+  const queueRetryTimerRef = React.useRef(null);
 
   // Resuming an already-active session (e.g. the page reloaded mid-hunt)
   // — hydrate the existing points/tags instead of starting from empty.
@@ -2672,8 +2784,35 @@ function LiveTracker({ booking, goBack }) {
     if (!session || pendingPointsRef.current.length === 0) return;
     const batch = pendingPointsRef.current;
     pendingPointsRef.current = [];
-    apiFetch(`/tracking/${session.id}/points`, { method: "POST", body: { points: batch } }).catch(() => {});
+    apiFetch(`/tracking/${session.id}/points`, { method: "POST", body: { points: batch } })
+      .catch(() => offlineQueueAddPoints(session.id, batch).then(runFlushQueue));
   }
+
+  // Retries whatever's sitting in the offline queue — leftovers from a
+  // previous session included, not just this one. Runs on mount, on the
+  // browser's 'online' event, and on a short interval as a backstop
+  // (navigator.onLine/the 'online' event only reflect link state, not
+  // real internet reachability, so a timer that just tries the request
+  // is the more honest signal).
+  function runFlushQueue() {
+    offlineQueueFlush((item) => {
+      if (item.kind === "sos") {
+        setSosSent(true);
+        setSosQueued(false);
+      }
+    }).then(setQueueSize);
+  }
+
+  React.useEffect(() => {
+    runFlushQueue();
+    window.addEventListener("online", runFlushQueue);
+    queueRetryTimerRef.current = setInterval(runFlushQueue, 15000);
+    return () => {
+      window.removeEventListener("online", runFlushQueue);
+      clearInterval(queueRetryTimerRef.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // GPS watch + periodic flush + screen wake lock, active only while a
   // session exists and hasn't ended.
@@ -2727,10 +2866,8 @@ function LiveTracker({ booking, goBack }) {
       setError("Waiting for a GPS fix before you can add a tag.");
       return;
     }
-    apiFetch(`/tracking/${session.id}/tags`, {
-      method: "POST",
-      body: { tag_type: tagType, latitude: currentPos[0], longitude: currentPos[1], notes: noteDraft || null },
-    })
+    const body = { tag_type: tagType, latitude: currentPos[0], longitude: currentPos[1], notes: noteDraft || null };
+    apiFetch(`/tracking/${session.id}/tags`, { method: "POST", body })
       .then((r) => {
         if (!r.ok) return r.json().then((e) => Promise.reject(new Error(e.error)));
         return r.json();
@@ -2740,7 +2877,21 @@ function LiveTracker({ booking, goBack }) {
         setNoteDraft("");
         setError(null);
       })
-      .catch((e) => setError(e.message));
+      .catch((e) => {
+        // fetch() rejects with TypeError specifically for a network
+        // failure (no connection at all) — anything else (e.g. the
+        // server rejecting the request) is a real error, not a
+        // connectivity problem, so it's shown rather than queued.
+        if (e instanceof TypeError) {
+          offlineQueueAddOne("tag", session.id, body).then(runFlushQueue);
+          setTags((prev) => [...prev, { id: `local-${Date.now()}`, ...body }]);
+          setNoteDraft("");
+          setError(null);
+          setQueueSize((n) => n + 1);
+        } else {
+          setError(e.message);
+        }
+      });
   }
 
   function stopTracking() {
@@ -2769,13 +2920,20 @@ function LiveTracker({ booking, goBack }) {
 
   function triggerSos() {
     if (!currentPos || !session) return;
-    apiFetch(`/tracking/${session.id}/sos`, {
-      method: "POST",
-      body: { latitude: currentPos[0], longitude: currentPos[1] },
-    })
-      .then((r) => (r.ok ? r.json() : Promise.reject()))
+    const body = { latitude: currentPos[0], longitude: currentPos[1] };
+    apiFetch(`/tracking/${session.id}/sos`, { method: "POST", body })
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error("SOS request failed"))))
       .then(() => setSosSent(true))
-      .catch(() => setError("Could not send SOS — check your connection and try again."));
+      .catch((e) => {
+        if (e instanceof TypeError) {
+          offlineQueueAddOne("sos", session.id, body).then(runFlushQueue);
+          setSosQueued(true);
+          setError(null);
+          setQueueSize((n) => n + 1);
+        } else {
+          setError("Could not send SOS — check your connection and try again.");
+        }
+      });
   }
 
   function cancelSosHold() {
@@ -2785,6 +2943,7 @@ function LiveTracker({ booking, goBack }) {
   }
   function startSosHold() {
     setSosSent(false);
+    setSosQueued(false);
     const startedAt = Date.now();
     sosIntervalRef.current = setInterval(() => {
       setSosProgress(Math.min(1, (Date.now() - startedAt) / SOS_HOLD_MS));
@@ -2828,6 +2987,16 @@ function LiveTracker({ booking, goBack }) {
         choose to share it.
       </div>
       <GeofenceStatus booking={{ geofence_required: booking.geofence_required, tracking_session: session }} />
+
+      {queueSize > 0 && (
+        <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 10 }}>
+          <RefreshCw size={12} color={C.gold} />
+          <span style={{ ...fontBody, fontSize: 12, color: C.goldDeep }}>
+            No signal — {queueSize} item{queueSize === 1 ? "" : "s"} saved on this device, will send
+            automatically once you're back in range.
+          </span>
+        </div>
+      )}
 
       {error && <div style={{ ...fontBody, fontSize: 12.5, color: C.rust, marginBottom: 10 }}>{error}</div>}
 
@@ -2925,7 +3094,13 @@ function LiveTracker({ booking, goBack }) {
                   <Siren size={16} /> HOLD FOR SOS
                 </span>
               </button>
-              {sosSent && (
+              {sosQueued && (
+                <div style={{ ...fontBody, fontSize: 12.5, color: C.rust, marginTop: 8, textAlign: "center" }}>
+                  No signal — SOS saved on this device and will send the moment you're back in range.
+                  Keep this screen open.
+                </div>
+              )}
+              {sosSent && !sosQueued && (
                 <div style={{ ...fontBody, fontSize: 12.5, color: C.rust, marginTop: 8, textAlign: "center" }}>
                   SOS sent — the farmer and any nearby opted-in hunters have been alerted.
                 </div>

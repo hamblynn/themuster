@@ -530,6 +530,27 @@ app.delete("/api/admin/species/:id", requireAdminAuth, (req, res) => {
   res.json({ ok: true });
 });
 
+// GET /api/properties/browse — hunter-only. Mirrors /matches (farmer
+// discovers hunters) in reverse: every property, sorted nearest-first
+// from the hunter's own location, no species/capability filtering
+// (matches doesn't filter on that either — keep parity). Registered
+// before /api/properties/:id below — Express matches routes in
+// registration order and :id matches any string including "browse",
+// so this must come first or that catch-all swallows it.
+app.get("/api/properties/browse", requireAuth("hunter"), (req, res) => {
+  const hunter = db.prepare(`SELECT * FROM hunters WHERE id = ?`).get(req.user.id);
+  const properties = db.prepare(`SELECT * FROM properties`).all();
+
+  const results = properties
+    .map((p) => ({
+      ...publicPropertyView(p, req.user.id),
+      distance_km: Math.round(distanceKm(hunter.latitude, hunter.longitude, p.latitude, p.longitude) * 10) / 10,
+    }))
+    .sort((a, b) => a.distance_km - b.distance_km);
+
+  res.json(results);
+});
+
 // GET /api/properties/:id — owner only
 app.get("/api/properties/:id", requireAuth("farmer"), (req, res) => {
   const property = db.prepare(`SELECT * FROM properties WHERE id = ?`).get(req.params.id);
@@ -551,6 +572,15 @@ app.get("/api/properties/:id", requireAuth("farmer"), (req, res) => {
   property.sightings = db
     .prepare(`SELECT * FROM sightings WHERE property_id = ? ORDER BY reported_date DESC`)
     .all(property.id);
+  property.exclusivity_requests = db
+    .prepare(
+      `SELECT er.*, h.name AS hunter_name, h.rating_avg, h.rating_count
+       FROM exclusivity_requests er JOIN hunters h ON h.id = er.hunter_id
+       WHERE er.property_id = ? AND er.status = 'requested'
+       ORDER BY er.created_at ASC`
+    )
+    .all(property.id);
+  attachOwnerExclusivityHolder(property);
 
   res.json(property);
 });
@@ -588,6 +618,157 @@ app.get("/api/properties/:id/matches", requireAuth("farmer"), (req, res) => {
     .sort((a, b) => a.distance_km - b.distance_km);
 
   res.json(matches);
+});
+
+// Shared allowlist for hunter-facing property views (/browse and
+// /:id/public) — deliberately excludes access_notes (gate codes),
+// address, latitude/longitude, and sightings, none of which should be
+// visible before a real booking relationship exists. Never who else
+// holds exclusivity on a property that isn't the requester's own —
+// nothing else in this app exposes one hunter's activity to another.
+// Attaches exclusive_hunter_name and exclusive_request_id (the approved
+// row's id, which the owner needs to revoke it via
+// PATCH /api/exclusivity-requests/:id) to an owner-facing property view.
+function attachOwnerExclusivityHolder(property) {
+  if (!property.exclusive_hunter_id) return;
+  const holder = db
+    .prepare(
+      `SELECT h.name AS hunter_name, er.id AS request_id
+       FROM exclusivity_requests er JOIN hunters h ON h.id = er.hunter_id
+       WHERE er.property_id = ? AND er.hunter_id = ? AND er.status = 'approved'`
+    )
+    .get(property.id, property.exclusive_hunter_id);
+  property.exclusive_hunter_name = holder?.hunter_name;
+  property.exclusive_request_id = holder?.request_id;
+}
+
+function publicPropertyView(property, viewerHunterId) {
+  const species = withAtcwExpiryStatus(
+    db
+      .prepare(
+        `SELECT ps.*, gs.label, gs.requires_atcw, gs.is_other
+         FROM property_species ps JOIN game_species gs ON gs.value = ps.species
+         WHERE ps.property_id = ?`
+      )
+      .all(property.id)
+  ).map((s) => ({ species: s.species, label: s.label, status: s.status }));
+
+  const view = {
+    id: property.id,
+    name: property.name,
+    suburb: property.suburb,
+    size_hectares: property.size_hectares,
+    permitted_hours: property.permitted_hours,
+    allow_spotlighting: !!property.allow_spotlighting,
+    verification_status: property.verification_status,
+    exclusivity_mode: property.exclusivity_mode,
+    species,
+    no_go_zone_labels: db
+      .prepare(`SELECT label FROM no_go_zones WHERE property_id = ?`)
+      .all(property.id)
+      .map((z) => z.label),
+  };
+  if (property.exclusive_hunter_id === viewerHunterId) {
+    // Own current holding — safe to include which request row it is,
+    // since the viewer needs it to relinquish (PATCH /exclusivity-requests/:id).
+    view.is_mine = true;
+    view.exclusivity_request_id = db
+      .prepare(`SELECT id FROM exclusivity_requests WHERE property_id = ? AND hunter_id = ? AND status = 'approved'`)
+      .get(property.id, viewerHunterId)?.id;
+  } else if (property.exclusive_hunter_id) {
+    view.exclusively_held = true;
+  } else if (viewerHunterId) {
+    const pending = db
+      .prepare(`SELECT id FROM exclusivity_requests WHERE property_id = ? AND hunter_id = ? AND status = 'requested'`)
+      .get(property.id, viewerHunterId);
+    if (pending) {
+      view.pending_request_id = pending.id;
+    }
+  }
+  return view;
+}
+
+// GET /api/properties/:id/public — any authenticated user. The
+// hunter-safe detail view — see publicPropertyView() for exactly what's
+// withheld and why.
+app.get("/api/properties/:id/public", requireAuth(), (req, res) => {
+  const property = db.prepare(`SELECT * FROM properties WHERE id = ?`).get(req.params.id);
+  if (!property) return res.status(404).json({ error: "Property not found" });
+  res.json(publicPropertyView(property, req.user.role === "hunter" ? req.user.id : null));
+});
+
+// ===========================================================
+// EXCLUSIVITY REQUESTS
+// A hunter requests sole standing to book a property (the farmer must
+// have opted the property into exclusivity_mode='exclusive' first via
+// PATCH /api/properties/:id). At most one 'approved' row per property;
+// approving one auto-declines any other still-pending requests for the
+// same property, since under exclusive semantics they're moot.
+// ===========================================================
+
+// POST /api/properties/:id/exclusivity-requests — hunter only
+app.post("/api/properties/:id/exclusivity-requests", requireAuth("hunter"), (req, res) => {
+  const property = db.prepare(`SELECT * FROM properties WHERE id = ?`).get(req.params.id);
+  if (!property) return res.status(404).json({ error: "Property not found" });
+  if (property.exclusivity_mode !== "exclusive") {
+    return res.status(400).json({ error: "This property isn't accepting exclusivity requests" });
+  }
+  if (property.exclusive_hunter_id) {
+    return res.status(400).json({ error: "This property already has exclusive access granted to another hunter" });
+  }
+  const hunter = db.prepare(`SELECT is_active FROM hunters WHERE id = ?`).get(req.user.id);
+  if (!hunter?.is_active) {
+    return res.status(403).json({ error: "Your account must be active to request exclusive access" });
+  }
+  const existing = db
+    .prepare(`SELECT id FROM exclusivity_requests WHERE property_id = ? AND hunter_id = ? AND status = 'requested'`)
+    .get(req.params.id, req.user.id);
+  if (existing) {
+    return res.status(400).json({ error: "You already have a pending request for this property" });
+  }
+
+  const result = db
+    .prepare(`INSERT INTO exclusivity_requests (property_id, hunter_id) VALUES (?, ?)`)
+    .run(req.params.id, req.user.id);
+  res.status(201).json(db.prepare(`SELECT * FROM exclusivity_requests WHERE id = ?`).get(result.lastInsertRowid));
+});
+
+// PATCH /api/exclusivity-requests/:id — body: { status: 'approved'|'declined'|'revoked' }
+// approve/decline: the owning farmer only. revoke: the owning farmer OR
+// the hunter currently holding exclusivity on that property.
+app.patch("/api/exclusivity-requests/:id", requireAuth(), (req, res) => {
+  const { status } = req.body;
+  if (!["approved", "declined", "revoked"].includes(status)) {
+    return res.status(400).json({ error: "status must be 'approved', 'declined' or 'revoked'" });
+  }
+  const request = db.prepare(`SELECT * FROM exclusivity_requests WHERE id = ?`).get(req.params.id);
+  if (!request) return res.status(404).json({ error: "Exclusivity request not found" });
+  const property = db.prepare(`SELECT * FROM properties WHERE id = ?`).get(request.property_id);
+
+  const isOwnerFarmer = req.user.role === "farmer" && property.farmer_id === req.user.id;
+  const isHoldingHunter = req.user.role === "hunter" && property.exclusive_hunter_id === req.user.id;
+
+  if ((status === "approved" || status === "declined") && !isOwnerFarmer) {
+    return res.status(403).json({ error: "Only the property owner can approve or decline a request" });
+  }
+  if (status === "revoked" && !isOwnerFarmer && !isHoldingHunter) {
+    return res.status(403).json({ error: "Only the property owner or the current holder can revoke exclusivity" });
+  }
+
+  db.prepare(`UPDATE exclusivity_requests SET status = ?, decided_at = datetime('now') WHERE id = ?`)
+    .run(status, request.id);
+
+  if (status === "approved") {
+    db.prepare(`UPDATE properties SET exclusive_hunter_id = ? WHERE id = ?`).run(request.hunter_id, property.id);
+    db.prepare(
+      `UPDATE exclusivity_requests SET status = 'declined', decided_at = datetime('now')
+       WHERE property_id = ? AND status = 'requested' AND id != ?`
+    ).run(property.id, request.id);
+  } else if (status === "revoked") {
+    db.prepare(`UPDATE properties SET exclusive_hunter_id = NULL WHERE id = ?`).run(property.id);
+  }
+
+  res.json(db.prepare(`SELECT * FROM exclusivity_requests WHERE id = ?`).get(request.id));
 });
 
 // POST /api/properties — logged-in farmer lists a new property
@@ -678,6 +859,7 @@ app.patch("/api/properties/:id", requireAuth("farmer"), (req, res) => {
     "name", "pic_code", "lot_number", "plan_number", "address", "suburb",
     "latitude", "longitude", "size_hectares", "access_notes",
     "permitted_hours", "allow_spotlighting", "geofence_radius_m", "ownership_document_url",
+    "exclusivity_mode",
   ];
   const updates = {};
   editable.forEach((field) => {
@@ -699,11 +881,25 @@ app.patch("/api/properties/:id", requireAuth("farmer"), (req, res) => {
     updates.verified_by_admin = null;
     updates.verified_at = null;
   }
+  // Turning exclusivity off must clear the current holder and decline
+  // any still-pending requests in the same step — otherwise a property
+  // that's nominally 'shared' again could still show an "exclusive
+  // holder," a dangling state with no UI able to fix it.
+  const turningExclusivityOff = updates.exclusivity_mode === "shared" && existing.exclusivity_mode === "exclusive";
+  if (turningExclusivityOff) {
+    updates.exclusive_hunter_id = null;
+  }
 
   try {
     if (Object.keys(updates).length > 0) {
       const setClause = Object.keys(updates).map((k) => `${k} = @${k}`).join(", ");
       db.prepare(`UPDATE properties SET ${setClause} WHERE id = @id`).run({ ...updates, id: req.params.id });
+    }
+    if (turningExclusivityOff) {
+      db.prepare(
+        `UPDATE exclusivity_requests SET status = 'declined', decided_at = datetime('now')
+         WHERE property_id = ? AND status = 'requested'`
+      ).run(req.params.id);
     }
 
     if (Array.isArray(req.body.no_go_zones)) {
@@ -731,6 +927,15 @@ app.patch("/api/properties/:id", requireAuth("farmer"), (req, res) => {
         )
         .all(updated.id)
     );
+    updated.exclusivity_requests = db
+      .prepare(
+        `SELECT er.*, h.name AS hunter_name, h.rating_avg, h.rating_count
+         FROM exclusivity_requests er JOIN hunters h ON h.id = er.hunter_id
+         WHERE er.property_id = ? AND er.status = 'requested'
+         ORDER BY er.created_at ASC`
+      )
+      .all(updated.id);
+    attachOwnerExclusivityHolder(updated);
     res.json(updated);
   } catch (e) {
     res.status(400).json({
@@ -1150,41 +1355,65 @@ function assertBookingAccess(req, res, booking) {
   return true;
 }
 
-// POST /api/bookings — logged-in farmer books a hunter on one of their own properties
-// body: { property_id, hunter_id, requested_date, start_time, end_time, farmer_note }
-app.post("/api/bookings", requireAuth("farmer"), (req, res) => {
-  const { property_id, hunter_id, requested_date, start_time, end_time, farmer_note, geofence_required } = req.body;
-  if (!property_id || !hunter_id || !requested_date) {
-    return res.status(400).json({ error: "property_id, hunter_id and requested_date are required" });
+// POST /api/bookings — either a farmer books a hunter on their own
+// property (the original flow), or a hunter books themself on a
+// property where they hold exclusive access (new — see
+// exclusivity_requests above). Either way the request still needs the
+// other party's approval: see allowedBookingTransitions() below for why
+// initiated_by exists and how it's enforced.
+// body: { property_id, hunter_id (farmer path only), requested_date, start_time, end_time, farmer_note }
+app.post("/api/bookings", requireAuth(), (req, res) => {
+  const { property_id, requested_date, start_time, end_time, farmer_note, geofence_required } = req.body;
+  if (!property_id || !requested_date) {
+    return res.status(400).json({ error: "property_id and requested_date are required" });
   }
-  const property = db.prepare(`SELECT farmer_id, name FROM properties WHERE id = ?`).get(property_id);
-  if (!property || property.farmer_id !== req.user.id) {
-    return res.status(403).json({ error: "You can only book on your own properties" });
+  const property = db.prepare(`SELECT farmer_id, name, exclusive_hunter_id FROM properties WHERE id = ?`).get(property_id);
+  if (!property) return res.status(404).json({ error: "Property not found" });
+
+  let hunter_id, initiated_by;
+  if (req.user.role === "farmer") {
+    if (property.farmer_id !== req.user.id) {
+      return res.status(403).json({ error: "You can only book on your own properties" });
+    }
+    hunter_id = req.body.hunter_id;
+    if (!hunter_id) return res.status(400).json({ error: "hunter_id is required" });
+    initiated_by = "farmer";
+  } else {
+    if (property.exclusive_hunter_id !== req.user.id) {
+      return res.status(403).json({ error: "You can only request bookings directly on farms where you hold exclusive access" });
+    }
+    hunter_id = req.user.id; // ignore any client-supplied hunter_id — always self
+    initiated_by = "hunter";
   }
 
   const hunter = db.prepare(`SELECT * FROM hunters WHERE id = ?`).get(hunter_id);
   if (!hunter) return res.status(404).json({ error: "Hunter not found" });
   if (!isHunterAvailable(hunter, requested_date)) {
     return res.status(400).json({
-      error: `${hunter.name} is ${describeAvailability(hunter)} — ${requested_date} isn't one of their available days`,
+      error: `${initiated_by === "farmer" ? hunter.name + " is" : "You're"} ${describeAvailability(hunter)} — ${requested_date} isn't ${initiated_by === "farmer" ? "one of their" : "one of your"} available days`,
     });
   }
 
   const result = db
     .prepare(`
-      INSERT INTO bookings (property_id, hunter_id, requested_date, start_time, end_time, farmer_note, geofence_required, status)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 'requested')
+      INSERT INTO bookings (property_id, hunter_id, requested_date, start_time, end_time, farmer_note, geofence_required, status, initiated_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'requested', ?)
     `)
-    .run(property_id, hunter_id, requested_date, start_time || null, end_time || null, farmer_note || null, geofence_required ? 1 : 0);
+    .run(property_id, hunter_id, requested_date, start_time || null, end_time || null, farmer_note || null, geofence_required ? 1 : 0, initiated_by);
 
   const booking = db.prepare(`SELECT * FROM bookings WHERE id = ?`).get(result.lastInsertRowid);
 
-  const farmer = db.prepare(`SELECT name FROM farmers WHERE id = ?`).get(req.user.id);
+  const farmer = db.prepare(`SELECT name FROM farmers WHERE id = ?`).get(property.farmer_id);
+  const when = `${requested_date}${start_time && end_time ? ` (${start_time}–${end_time})` : ""}`;
   sendEmail(
     `New booking request — ${property.name}, ${requested_date}`,
-    `<p><strong>${farmer.name}</strong> requested you (${hunter.name}) for <strong>${property.name}</strong> on ${requested_date}${start_time && end_time ? ` (${start_time}–${end_time})` : ""}.</p>` +
-      (farmer_note ? `<p>Note: ${farmer_note}</p>` : "") +
-      `<p>Log in to The Muster to accept or decline.</p>`
+    initiated_by === "farmer"
+      ? `<p><strong>${farmer.name}</strong> requested you (${hunter.name}) for <strong>${property.name}</strong> on ${when}.</p>` +
+        (farmer_note ? `<p>Note: ${farmer_note}</p>` : "") +
+        `<p>Log in to The Muster to accept or decline.</p>`
+      : `<p><strong>${hunter.name}</strong>, who holds exclusive access to <strong>${property.name}</strong>, requested a booking on ${when}.</p>` +
+        (farmer_note ? `<p>Note: ${farmer_note}</p>` : "") +
+        `<p>Log in to The Muster to accept or decline.</p>`
   );
 
   res.status(201).json(booking);
@@ -1318,36 +1547,43 @@ app.post("/api/bookings/:id/harvest-declarations", requireAuth(), (req, res) => 
 });
 
 // PATCH /api/bookings/:id — update status. Only the farmer who owns the
-// property or the booked hunter may act, and each role can only move the
-// booking to the statuses that make sense from their side: the hunter
-// accepts/declines the request (or marks it done), the farmer can call it
-// off or mark it done.
-const BOOKING_STATUS_TRANSITIONS_BY_ROLE = {
-  hunter: ["approved", "declined", "completed"],
-  farmer: ["cancelled", "completed"],
-};
+// property or the booked hunter may act. Which statuses a role can set
+// depends on whether they *initiated* this particular booking, not on
+// their role alone — a booking can now be created by either side (see
+// POST /api/bookings above). The initiator can only cancel it or mark it
+// done; the recipient is the one who accepts/declines (or marks it
+// done). Without this, an initiator could self-approve their own
+// request — a farmer created every booking until hunter-initiated ones
+// existed, so this was never reachable before.
+function allowedBookingTransitions(role, booking) {
+  const isInitiator = role === booking.initiated_by;
+  return isInitiator ? ["cancelled", "completed"] : ["approved", "declined", "completed"];
+}
 app.patch("/api/bookings/:id", requireAuth(), (req, res) => {
   const booking = db.prepare(`SELECT * FROM bookings WHERE id = ?`).get(req.params.id);
   if (!booking) return res.status(404).json({ error: "Booking not found" });
   if (!assertBookingAccess(req, res, booking)) return;
 
   const { status } = req.body;
-  const allowed = BOOKING_STATUS_TRANSITIONS_BY_ROLE[req.user.role];
+  const allowed = allowedBookingTransitions(req.user.role, booking);
   if (!allowed.includes(status)) {
-    return res.status(400).json({ error: `As a ${req.user.role}, status must be one of ${allowed.join(", ")}` });
+    const as = req.user.role === booking.initiated_by ? "the requester" : "the recipient";
+    return res.status(400).json({ error: `As ${as}, status must be one of ${allowed.join(", ")}` });
   }
 
   db.prepare(`UPDATE bookings SET status = ?, updated_at = datetime('now') WHERE id = ?`)
     .run(status, req.params.id);
 
-  // Tell the farmer what happened to their request — the hunter already
-  // knows, they're the one who just clicked Accept/Decline.
-  if (req.user.role === "hunter" && (status === "approved" || status === "declined")) {
+  // Tell the initiator what happened — the recipient already knows,
+  // they're the one who just clicked Accept/Decline.
+  if (req.user.role !== booking.initiated_by && (status === "approved" || status === "declined")) {
     const property = db.prepare(`SELECT name FROM properties WHERE id = ?`).get(booking.property_id);
     const hunter = db.prepare(`SELECT name FROM hunters WHERE id = ?`).get(booking.hunter_id);
+    const actorName =
+      req.user.role === "hunter" ? hunter.name : db.prepare(`SELECT name FROM farmers WHERE id = ?`).get(req.user.id)?.name;
     sendEmail(
       `Booking ${status} — ${property.name}, ${booking.requested_date}`,
-      `<p><strong>${hunter.name}</strong> ${status} your booking request for <strong>${property.name}</strong> on ${booking.requested_date}.</p>` +
+      `<p><strong>${actorName}</strong> ${status} the booking request for <strong>${property.name}</strong> on ${booking.requested_date}.</p>` +
         `<p>Log in to The Muster for details.</p>`
     );
   }

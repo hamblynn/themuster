@@ -10,6 +10,7 @@ DROP TABLE IF EXISTS reviews;
 DROP TABLE IF EXISTS messages;
 DROP TABLE IF EXISTS harvest_declarations;
 DROP TABLE IF EXISTS bookings;
+DROP TABLE IF EXISTS exclusivity_requests;
 DROP TABLE IF EXISTS credentials;
 DROP TABLE IF EXISTS hunters;
 DROP TABLE IF EXISTS no_go_zones;

@@ -1891,6 +1891,490 @@ function BookingRequest({ hunterId, hunterName, goBack, goMessages }) {
 }
 
 /* ---------------------------------------------------------
+   SCREEN — BROWSE FARMS (hunter)
+   Mirrors FarmerDashboard's "Matched harvesters" list in reverse —
+   the first screen where hunters discover properties directly rather
+   than only reacting to a farmer-initiated booking.
+--------------------------------------------------------- */
+function BrowseFarms({ goFarm }) {
+  const { user } = useAuth();
+  const [properties, setProperties] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  React.useEffect(() => {
+    if (!user || user.role !== "hunter") {
+      setLoading(false);
+      return;
+    }
+    setLoading(true);
+    apiFetch("/properties/browse")
+      .then((r) => {
+        if (!r.ok) throw new Error("Could not load properties");
+        return r.json();
+      })
+      .then((data) => {
+        setProperties(data);
+        setError(null);
+      })
+      .catch((e) => setError(e.message))
+      .finally(() => setLoading(false));
+  }, [user?.role]);
+
+  if (!user) {
+    return <div style={{ ...fontBody, fontSize: 13, color: C.steel }}>Log in as a hunter to browse farms.</div>;
+  }
+  if (user.role !== "hunter") {
+    return (
+      <div style={{ ...fontBody, fontSize: 13, color: C.steel }}>
+        This screen is for hunter accounts. You're logged in as a farmer.
+      </div>
+    );
+  }
+  if (loading) {
+    return <div style={{ ...fontMono, fontSize: 12, color: C.steel }}>Loading farms…</div>;
+  }
+
+  return (
+    <div>
+      <div style={{ ...fontDisplay, fontSize: 22, color: C.charcoal }}>Browse farms</div>
+      <div style={{ ...fontBody, fontSize: 13, color: C.steel, marginTop: 2, marginBottom: 12 }}>
+        Every listed property, nearest first. Request exclusive access on farms that allow it, or wait to
+        be matched from the farmer's side.
+      </div>
+
+      {error && <div style={{ ...fontBody, fontSize: 12.5, color: C.rust, marginBottom: 10 }}>{error}</div>}
+      {properties.length === 0 && (
+        <div style={{ ...fontBody, fontSize: 12.5, color: C.steel }}>No properties listed yet.</div>
+      )}
+
+      <div className="muster-hunter-list">
+        {properties.map((p) => (
+          <div
+            key={p.id}
+            onClick={() => goFarm(p.id, p.name)}
+            style={{
+              background: C.white,
+              border: `1px solid ${C.line}`,
+              borderRadius: 12,
+              padding: 14,
+              cursor: "pointer",
+            }}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+              <div>
+                <div style={{ ...fontBody, fontWeight: 700, fontSize: 15, color: C.charcoal }}>
+                  {p.name}
+                  {p.suburb ? `, ${p.suburb}` : ""}
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 5, marginTop: 2 }}>
+                  <MapPin size={12} color={C.steel} />
+                  <span style={{ ...fontMono, fontSize: 11.5, color: C.steel }}>{p.distance_km} km away</span>
+                </div>
+              </div>
+              <EarTag
+                label="OWNERSHIP"
+                status={
+                  p.verification_status === "verified"
+                    ? "verified"
+                    : p.verification_status === "rejected"
+                    ? "missing"
+                    : "warning"
+                }
+              />
+            </div>
+            <div style={{ display: "flex", gap: 6, marginTop: 10, flexWrap: "wrap" }}>
+              {p.species.map((s) => (
+                <Pill key={s.species}>{s.label}</Pill>
+              ))}
+            </div>
+            {p.exclusivity_mode === "exclusive" && (
+              <div style={{ marginTop: 10 }}>
+                <Pill tone={p.is_mine || p.pending_request_id ? "gold" : p.exclusively_held ? "rust" : "mist"}>
+                  {p.is_mine
+                    ? "YOU HOLD THIS"
+                    : p.exclusively_held
+                    ? "EXCLUSIVE — TAKEN"
+                    : p.pending_request_id
+                    ? "REQUEST PENDING"
+                    : "OPEN FOR EXCLUSIVITY"}
+                </Pill>
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------
+   SCREEN — FARM PROFILE (hunter)
+   Mirrors HunterProfile — a detail screen reached from a list, with
+   the primary action at the bottom. Also where a hunter requests
+   exclusive access, or relinquishes it if they already hold it.
+--------------------------------------------------------- */
+function FarmProfile({ propertyId, goBooking, goBack }) {
+  const [property, setProperty] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [actionError, setActionError] = useState(null);
+  const [acting, setActing] = useState(false);
+
+  function load() {
+    if (!propertyId) return;
+    setLoading(true);
+    apiFetch(`/properties/${propertyId}/public`)
+      .then((r) => {
+        if (!r.ok) throw new Error("Could not load property");
+        return r.json();
+      })
+      .then((data) => {
+        setProperty(data);
+        setError(null);
+      })
+      .catch((e) => setError(e.message))
+      .finally(() => setLoading(false));
+  }
+
+  React.useEffect(load, [propertyId]);
+
+  function requestExclusivity() {
+    setActing(true);
+    setActionError(null);
+    apiFetch(`/properties/${propertyId}/exclusivity-requests`, { method: "POST" })
+      .then((r) => {
+        if (!r.ok) return r.json().then((e) => Promise.reject(new Error(e.error)));
+        return r.json();
+      })
+      .then(load)
+      .catch((e) => setActionError(e.message))
+      .finally(() => setActing(false));
+  }
+
+  function relinquish() {
+    if (!property?.exclusivity_request_id) return;
+    setActing(true);
+    setActionError(null);
+    apiFetch(`/exclusivity-requests/${property.exclusivity_request_id}`, {
+      method: "PATCH",
+      body: { status: "revoked" },
+    })
+      .then((r) => {
+        if (!r.ok) return r.json().then((e) => Promise.reject(new Error(e.error)));
+        return r.json();
+      })
+      .then(load)
+      .catch((e) => setActionError(e.message))
+      .finally(() => setActing(false));
+  }
+
+  const BackLink = () => (
+    <button
+      onClick={goBack}
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 4,
+        background: "none",
+        border: "none",
+        color: C.steel,
+        ...fontMono,
+        fontSize: 11.5,
+        cursor: "pointer",
+        padding: 0,
+        marginBottom: 14,
+      }}
+    >
+      <ChevronLeft size={13} /> BACK TO FARMS
+    </button>
+  );
+
+  if (!propertyId) {
+    return (
+      <div>
+        <BackLink />
+        <div style={{ ...fontBody, fontSize: 13, color: C.steel }}>Pick a farm from Browse farms first.</div>
+      </div>
+    );
+  }
+  if (loading) {
+    return (
+      <div>
+        <BackLink />
+        <div style={{ ...fontMono, fontSize: 12, color: C.steel }}>Loading farm…</div>
+      </div>
+    );
+  }
+  if (error) {
+    return (
+      <div>
+        <BackLink />
+        <div style={{ ...fontBody, fontSize: 13, color: C.rust }}>{error}</div>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <BackLink />
+
+      <div style={{ ...fontDisplay, fontSize: 24, color: C.charcoal }}>{property.name}</div>
+      <div style={{ ...fontMono, fontSize: 11.5, color: C.steel, marginTop: 3 }}>{property.suburb}</div>
+
+      <Divider />
+
+      <div style={{ ...fontBody, fontWeight: 600, fontSize: 13, color: C.charcoal, marginBottom: 10 }}>
+        Property details
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        {[
+          [MapPin, "Size", property.size_hectares ? `${property.size_hectares} ha` : "—"],
+          [Clock, "Permitted hours", property.permitted_hours || "—"],
+          [ShieldCheck, "Spotlighting", property.allow_spotlighting ? "Permitted at night" : "Not permitted"],
+        ].map(([Icon, label, val], i) => (
+          <div key={i} style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+            <Icon size={14} color={C.steel} style={{ marginTop: 2 }} />
+            <div>
+              <div style={{ ...fontMono, fontSize: 10.5, color: C.steel }}>{label}</div>
+              <div style={{ ...fontBody, fontSize: 12.5, color: C.charcoal }}>{val}</div>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <Divider />
+
+      <div style={{ ...fontBody, fontWeight: 600, fontSize: 13, color: C.charcoal, marginBottom: 10 }}>
+        Species permitted
+      </div>
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+        {property.species.length === 0 ? (
+          <span style={{ ...fontBody, fontSize: 12.5, color: C.steel }}>None listed.</span>
+        ) : (
+          property.species.map((s) => <Pill key={s.species}>{s.label}</Pill>)
+        )}
+      </div>
+      {property.no_go_zone_labels.length > 0 && (
+        <div style={{ ...fontBody, fontSize: 11.5, color: C.steel, marginTop: 10 }}>
+          No-go zones on file: {property.no_go_zone_labels.join(", ")}
+        </div>
+      )}
+
+      <Divider />
+
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+        <div style={{ ...fontBody, fontWeight: 600, fontSize: 13, color: C.charcoal }}>Ownership</div>
+        <EarTag
+          label="VERIFICATION"
+          status={
+            property.verification_status === "verified"
+              ? "verified"
+              : property.verification_status === "rejected"
+              ? "missing"
+              : "warning"
+          }
+        />
+      </div>
+
+      {property.exclusivity_mode === "exclusive" && (
+        <>
+          <Divider />
+          <div style={{ ...fontBody, fontWeight: 600, fontSize: 13, color: C.charcoal, marginBottom: 8 }}>
+            Exclusive access
+          </div>
+          {actionError && (
+            <div style={{ ...fontBody, fontSize: 12.5, color: C.rust, marginBottom: 8 }}>{actionError}</div>
+          )}
+          {property.is_mine && (
+            <>
+              <div style={{ ...fontBody, fontSize: 12.5, color: C.eucalyptDeep, marginBottom: 10 }}>
+                You hold exclusive access to this farm — future bookings are directed to you.
+              </div>
+              <GhostButton tone="rust" onClick={relinquish}>
+                {acting ? "…" : "Relinquish exclusive access"}
+              </GhostButton>
+            </>
+          )}
+          {!property.is_mine && property.exclusively_held && (
+            <div style={{ ...fontBody, fontSize: 12.5, color: C.steel }}>Already exclusive to another hunter.</div>
+          )}
+          {!property.is_mine && !property.exclusively_held && property.pending_request_id && (
+            <div style={{ ...fontBody, fontSize: 12.5, color: C.goldDeep }}>
+              Your request is pending the farmer's decision.
+            </div>
+          )}
+          {!property.is_mine && !property.exclusively_held && !property.pending_request_id && (
+            <GhostButton icon={ShieldCheck} onClick={requestExclusivity}>
+              {acting ? "Requesting…" : "Request exclusive access"}
+            </GhostButton>
+          )}
+        </>
+      )}
+
+      {property.is_mine && (
+        <div style={{ marginTop: 18 }}>
+          <PrimaryButton icon={Calendar} full onClick={goBooking}>
+            Request a booking
+          </PrimaryButton>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------
+   SCREEN — HUNTER BOOKING REQUEST
+   A hunter requesting a booking on a farm they hold exclusive access
+   to. Deliberately not a reuse of BookingRequest above, which hard-
+   assumes a farmer picking a hunter throughout (farmer_note framing,
+   harvest-declaration confirmation copy, myProperty lookup) — only the
+   date-row pattern is shared.
+--------------------------------------------------------- */
+function HunterBookingRequest({ propertyId, propertyName, goBack }) {
+  const { user } = useAuth();
+  const dateOptions = nextDates(21);
+  const [selectedDate, setSelectedDate] = useState(dateOptions[0]);
+  const [note, setNote] = useState("");
+  const [booking, setBooking] = useState(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState(null);
+
+  React.useEffect(() => {
+    if (!user || isHunterAvailableOn(user, selectedDate)) return;
+    const firstAvailable = dateOptions.find((d) => isHunterAvailableOn(user, d));
+    if (firstAvailable) setSelectedDate(firstAvailable);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.id]);
+
+  function submitBooking() {
+    setSubmitting(true);
+    apiFetch("/bookings", {
+      method: "POST",
+      body: { property_id: propertyId, requested_date: selectedDate, farmer_note: note || null },
+    })
+      .then((r) => {
+        if (!r.ok) return r.json().then((e) => Promise.reject(new Error(e.error)));
+        return r.json();
+      })
+      .then((created) => {
+        setBooking(created);
+        setError(null);
+      })
+      .catch((e) => setError(e.message))
+      .finally(() => setSubmitting(false));
+  }
+
+  if (!user || user.role !== "hunter") {
+    return (
+      <div style={{ ...fontBody, fontSize: 13, color: C.steel }}>Log in as a hunter to request a booking.</div>
+    );
+  }
+  if (!propertyId) {
+    return (
+      <div style={{ ...fontBody, fontSize: 13, color: C.steel }}>
+        Pick a farm you hold exclusive access to first.
+      </div>
+    );
+  }
+
+  if (booking) {
+    return (
+      <div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, color: C.eucalyptDeep }}>
+          <Check size={18} />
+          <span style={{ ...fontBody, fontWeight: 700, fontSize: 15 }}>Booking requested</span>
+        </div>
+        <div style={{ ...fontBody, fontSize: 13, color: C.bark, marginTop: 6 }}>
+          You requested {propertyName} on {formatShortDate(booking.requested_date)}. Status: {booking.status}.
+          The farmer will accept or decline it from their bookings list.
+        </div>
+        <Divider />
+        <GhostButton full onClick={goBack}>
+          Back to farm
+        </GhostButton>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <button
+        onClick={goBack}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 4,
+          background: "none",
+          border: "none",
+          color: C.steel,
+          ...fontMono,
+          fontSize: 11.5,
+          cursor: "pointer",
+          padding: 0,
+          marginBottom: 14,
+        }}
+      >
+        <ChevronLeft size={13} /> BACK TO FARM
+      </button>
+
+      <div style={{ ...fontDisplay, fontSize: 22, color: C.charcoal }}>Request a booking</div>
+      <div style={{ ...fontBody, fontSize: 13, color: C.steel, marginTop: 2 }}>at {propertyName}</div>
+
+      <Divider />
+
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 8 }}>
+        <div style={{ ...fontBody, fontWeight: 600, fontSize: 13, color: C.charcoal }}>Select a date</div>
+        <span style={{ ...fontMono, fontSize: 10, color: C.steel }}>{describeAvailability(user)}</span>
+      </div>
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+        {dateOptions.map((d) => {
+          const available = isHunterAvailableOn(user, d);
+          const selected = d === selectedDate;
+          return (
+            <div
+              key={d}
+              onClick={() => available && setSelectedDate(d)}
+              title={available ? undefined : "Outside your stated availability"}
+              style={{
+                textAlign: "center",
+                padding: "8px 10px",
+                borderRadius: 8,
+                cursor: available ? "pointer" : "not-allowed",
+                opacity: available ? 1 : 0.35,
+                border: `1.5px solid ${selected ? C.eucalyptDeep : C.line}`,
+                background: selected ? C.mist : "transparent",
+                ...fontMono,
+                fontSize: 11.5,
+                color: C.charcoal,
+              }}
+            >
+              {formatShortDate(d)}
+            </div>
+          );
+        })}
+      </div>
+
+      <Divider />
+      <TextField
+        label="NOTE (OPTIONAL)"
+        value={note}
+        onChange={setNote}
+        placeholder="e.g. Planning to focus on the eastern paddock"
+        multiline
+      />
+
+      {error && <div style={{ ...fontBody, fontSize: 12.5, color: C.rust, marginTop: 10 }}>{error}</div>}
+
+      <Divider />
+      <PrimaryButton icon={Send} full onClick={submitBooking}>
+        {submitting ? "Sending…" : "Send booking request"}
+      </PrimaryButton>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------
    SCREEN 4 — REFER A HUNTER TO A NEIGHBOUR
 --------------------------------------------------------- */
 /* ---------------------------------------------------------
@@ -2580,7 +3064,7 @@ function HunterBookings({ goMessages, goLiveTracker }) {
                     {b.start_time && b.end_time ? ` · ${b.start_time}–${b.end_time}` : ""}
                   </div>
                   <div style={{ ...fontBody, fontSize: 12, color: C.steel, marginTop: 2 }}>
-                    Requested by {b.farmer_name}
+                    {b.initiated_by === "hunter" ? "Requested by you" : `Requested by ${b.farmer_name}`}
                   </div>
                 </div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 4, alignItems: "flex-end" }}>
@@ -2604,12 +3088,20 @@ function HunterBookings({ goMessages, goLiveTracker }) {
               <GeofenceStatus booking={b} />
 
               <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap" }}>
-                <PrimaryButton icon={Check} onClick={() => respond(b.id, "approved")}>
-                  {actingId === b.id ? "…" : "Accept"}
-                </PrimaryButton>
-                <GhostButton tone="rust" onClick={() => respond(b.id, "declined")}>
-                  {actingId === b.id ? "…" : "Decline"}
-                </GhostButton>
+                {b.initiated_by === "hunter" ? (
+                  <GhostButton tone="rust" onClick={() => respond(b.id, "cancelled")}>
+                    {actingId === b.id ? "…" : "Cancel request"}
+                  </GhostButton>
+                ) : (
+                  <>
+                    <PrimaryButton icon={Check} onClick={() => respond(b.id, "approved")}>
+                      {actingId === b.id ? "…" : "Accept"}
+                    </PrimaryButton>
+                    <GhostButton tone="rust" onClick={() => respond(b.id, "declined")}>
+                      {actingId === b.id ? "…" : "Decline"}
+                    </GhostButton>
+                  </>
+                )}
                 <GhostButton icon={MessageSquare} onClick={() => goMessages(b.id, b.farmer_name, "hunterBookings")}>
                   Message
                 </GhostButton>
@@ -2661,6 +3153,11 @@ function HunterBookings({ goMessages, goLiveTracker }) {
                   {b.status === "approved" && (
                     <GhostButton icon={MapPin} onClick={() => goLiveTracker(b)}>
                       {b.tracking_session && !b.tracking_session.ended_at ? "Continue tracking" : "Start tracking"}
+                    </GhostButton>
+                  )}
+                  {b.status === "approved" && b.initiated_by === "hunter" && (
+                    <GhostButton tone="rust" onClick={() => respond(b.id, "cancelled")}>
+                      {actingId === b.id ? "…" : "Cancel"}
                     </GhostButton>
                   )}
                 </div>
@@ -3478,7 +3975,8 @@ function FarmerBookings({ goMessages, goTrackingView }) {
         <div>
           <div style={{ ...fontDisplay, fontSize: 22, color: C.charcoal }}>My bookings</div>
           <div style={{ ...fontBody, fontSize: 13, color: C.steel, marginTop: 2 }}>
-            Requests you've sent to hunters.
+            Requests you've sent to hunters, plus requests from hunters who hold exclusive access to
+            one of your properties.
           </div>
         </div>
         <ViewModeToggle viewMode={viewMode} onChange={setViewMode} />
@@ -3492,7 +3990,7 @@ function FarmerBookings({ goMessages, goTrackingView }) {
 
       {bookings.length === 0 && (
         <div style={{ ...fontBody, fontSize: 12.5, color: C.steel }}>
-          No booking requests sent yet — request one from a hunter's profile.
+          No booking requests yet — request one from a hunter's profile.
         </div>
       )}
 
@@ -3535,7 +4033,17 @@ function FarmerBookings({ goMessages, goTrackingView }) {
               <GhostButton icon={MessageSquare} onClick={() => goMessages(b.id, b.hunter_name, "farmerBookings")}>
                 Message
               </GhostButton>
-              {(b.status === "requested" || b.status === "approved") && (
+              {b.status === "requested" && b.initiated_by === "hunter" && (
+                <>
+                  <GhostButton icon={Check} onClick={() => updateStatus(b.id, "approved")}>
+                    {actingId === b.id ? "…" : "Accept"}
+                  </GhostButton>
+                  <GhostButton icon={X} tone="rust" onClick={() => updateStatus(b.id, "declined")}>
+                    {actingId === b.id ? "…" : "Decline"}
+                  </GhostButton>
+                </>
+              )}
+              {b.initiated_by !== "hunter" && (b.status === "requested" || b.status === "approved") && (
                 <GhostButton icon={X} tone="rust" onClick={() => updateStatus(b.id, "cancelled")}>
                   {actingId === b.id ? "…" : "Cancel"}
                 </GhostButton>
@@ -3777,6 +4285,12 @@ function EditProperty({ goBack, onSaved }) {
   const [geofenceRadiusM, setGeofenceRadiusM] = useState("1000");
   const [ownershipDocumentUrl, setOwnershipDocumentUrl] = useState("");
   const [verificationStatus, setVerificationStatus] = useState("pending");
+  const [exclusivityMode, setExclusivityMode] = useState("shared");
+  const [exclusivityRequests, setExclusivityRequests] = useState([]);
+  const [exclusiveHunterName, setExclusiveHunterName] = useState(null);
+  const [exclusiveRequestId, setExclusiveRequestId] = useState(null);
+  const [exclusivityActionError, setExclusivityActionError] = useState(null);
+  const [exclusivityActing, setExclusivityActing] = useState(null);
   const [noGoZones, setNoGoZones] = useState([]);
   const [species, setSpecies] = useState({});
   const [speciesOptions, setSpeciesOptions] = useState([]);
@@ -3820,6 +4334,10 @@ function EditProperty({ goBack, onSaved }) {
         setGeofenceRadiusM(p.geofence_radius_m != null ? String(p.geofence_radius_m) : "1000");
         setOwnershipDocumentUrl(p.ownership_document_url || "");
         setVerificationStatus(p.verification_status || "pending");
+        setExclusivityMode(p.exclusivity_mode || "shared");
+        setExclusivityRequests(p.exclusivity_requests || []);
+        setExclusiveHunterName(p.exclusive_hunter_name || null);
+        setExclusiveRequestId(p.exclusive_request_id || null);
         setNoGoZones((p.no_go_zones || []).map((z) => ({ label: z.label, description: z.description || "" })));
         const speciesInit = {};
         (p.species || []).forEach((s) => {
@@ -3847,6 +4365,39 @@ function EditProperty({ goBack, onSaved }) {
   }
   function removeZone(index) {
     setNoGoZones((prev) => prev.filter((_, i) => i !== index));
+  }
+
+  // Re-fetches just the exclusivity-related fields after an approve/
+  // decline/revoke action — a full reload would also clobber any other
+  // field edits the farmer has mid-typed on this same screen.
+  function refreshExclusivity() {
+    if (!myProperty) return;
+    apiFetch(`/properties/${myProperty.id}`)
+      .then((r) => r.json())
+      .then((p) => {
+        setExclusivityRequests(p.exclusivity_requests || []);
+        setExclusiveHunterName(p.exclusive_hunter_name || null);
+        setExclusiveRequestId(p.exclusive_request_id || null);
+      })
+      .catch(() => {});
+  }
+
+  function decideExclusivityRequest(requestId, status) {
+    setExclusivityActing(requestId);
+    setExclusivityActionError(null);
+    apiFetch(`/exclusivity-requests/${requestId}`, { method: "PATCH", body: { status } })
+      .then((r) => {
+        if (!r.ok) return r.json().then((e) => Promise.reject(new Error(e.error)));
+        return r.json();
+      })
+      .then(refreshExclusivity)
+      .catch((e) => setExclusivityActionError(e.message))
+      .finally(() => setExclusivityActing(null));
+  }
+
+  function revokeExclusivity() {
+    if (!exclusiveRequestId) return;
+    decideExclusivityRequest(exclusiveRequestId, "revoked");
   }
 
   function toggleSpecies(value) {
@@ -3899,6 +4450,7 @@ function EditProperty({ goBack, onSaved }) {
         allow_spotlighting: allowSpotlighting,
         geofence_radius_m: parseInt(geofenceRadiusM, 10) || 1000,
         ownership_document_url: ownershipDocumentUrl,
+        exclusivity_mode: exclusivityMode,
         no_go_zones: noGoZones.filter((z) => z.label),
         species: checkedSpecies.map(([value, v]) => ({
           species: value,
@@ -3918,6 +4470,10 @@ function EditProperty({ goBack, onSaved }) {
       .then((updated) => {
         setSaved(true);
         setVerificationStatus(updated.verification_status || "pending");
+        setExclusivityMode(updated.exclusivity_mode || "shared");
+        setExclusivityRequests(updated.exclusivity_requests || []);
+        setExclusiveHunterName(updated.exclusive_hunter_name || null);
+        setExclusiveRequestId(updated.exclusive_request_id || null);
         updateProperty(updated);
         if (onSaved) onSaved(updated);
       })
@@ -4056,6 +4612,82 @@ function EditProperty({ goBack, onSaved }) {
             : "Awaiting admin review. Changing this link resubmits it for review."}
         </div>
       </div>
+
+      <Divider />
+      <SectionLabel>Exclusivity</SectionLabel>
+      <Checkbox
+        label="Allow hunters to request exclusive access"
+        checked={exclusivityMode === "exclusive"}
+        onChange={(checked) => setExclusivityMode(checked ? "exclusive" : "shared")}
+      />
+      <div style={{ ...fontBody, fontSize: 11.5, color: C.steel, marginTop: 4 }}>
+        When on, a hunter can request to be the only one who can book this property — you approve or
+        decline each request below, and can revoke it later. Save changes to apply this toggle.
+      </div>
+
+      {exclusivityMode === "exclusive" && (
+        <div style={{ marginTop: 12 }}>
+          {exclusivityActionError && (
+            <div style={{ ...fontBody, fontSize: 12.5, color: C.rust, marginBottom: 8 }}>
+              {exclusivityActionError}
+            </div>
+          )}
+          {exclusiveHunterName ? (
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                background: C.paperDim,
+                borderRadius: 10,
+                padding: 12,
+              }}
+            >
+              <div style={{ ...fontBody, fontSize: 12.5, color: C.bark }}>
+                Exclusive to <strong>{exclusiveHunterName}</strong>
+              </div>
+              <GhostButton tone="rust" onClick={revokeExclusivity}>
+                {exclusivityActing === exclusiveRequestId ? "…" : "Revoke"}
+              </GhostButton>
+            </div>
+          ) : exclusivityRequests.length === 0 ? (
+            <div style={{ ...fontBody, fontSize: 12, color: C.steel }}>No pending requests.</div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {exclusivityRequests.map((r) => (
+                <div
+                  key={r.id}
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    border: `1px solid ${C.line}`,
+                    borderRadius: 10,
+                    padding: 10,
+                  }}
+                >
+                  <div>
+                    <div style={{ ...fontBody, fontWeight: 600, fontSize: 12.5, color: C.charcoal }}>
+                      {r.hunter_name}
+                    </div>
+                    <div style={{ ...fontMono, fontSize: 10, color: C.steel }}>
+                      {r.rating_avg} ★ ({r.rating_count})
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", gap: 6 }}>
+                    <GhostButton onClick={() => decideExclusivityRequest(r.id, "approved")}>
+                      {exclusivityActing === r.id ? "…" : "Approve"}
+                    </GhostButton>
+                    <GhostButton tone="rust" onClick={() => decideExclusivityRequest(r.id, "declined")}>
+                      {exclusivityActing === r.id ? "…" : "Decline"}
+                    </GhostButton>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       <Divider />
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
@@ -5682,11 +6314,19 @@ function AppShell() {
   const [messagesReturnScreen, setMessagesReturnScreen] = useState("booking");
   const [trackingBooking, setTrackingBooking] = useState(null);
   const [trackingViewSessionId, setTrackingViewSessionId] = useState(null);
+  const [selectedPropertyId, setSelectedPropertyId] = useState(null);
+  const [selectedPropertyName, setSelectedPropertyName] = useState(null);
 
   function openProfile(id, name) {
     setSelectedHunterId(id);
     if (name) setSelectedHunterName(name);
     setScreen("profile");
+  }
+
+  function openFarm(id, name) {
+    setSelectedPropertyId(id);
+    if (name) setSelectedPropertyName(name);
+    setScreen("farmProfile");
   }
 
   function openMessages(bookingId, otherPartyName, returnScreen = "booking") {
@@ -5722,6 +6362,7 @@ function AppShell() {
     { id: "booking", label: "Booking request", Icon: Calendar, accent: C.eucalyptDeep, access: "farmer" },
     { id: "farmerBookings", label: "My bookings", Icon: ListChecks, accent: C.eucalyptDeep, access: "farmer" },
     { id: "hunterBookings", label: "Booking requests", Icon: ClipboardList, accent: C.goldDeep, access: "hunter" },
+    { id: "browseFarms", label: "Browse farms", Icon: MapPin, accent: C.goldDeep, access: "hunter" },
     { id: "hunterCredentials", label: "My credentials", Icon: ShieldCheck, accent: C.goldDeep, access: "hunter" },
     { id: "news", label: "News", Icon: Newspaper, accent: C.bark, access: "all" },
     { id: "messages", label: "Messages", Icon: MessageSquare, accent: C.bark, access: "all" },
@@ -5987,6 +6628,21 @@ function AppShell() {
           )}
           {screen === "liveTracker" && (
             <LiveTracker booking={trackingBooking} goBack={() => setScreen("hunterBookings")} />
+          )}
+          {screen === "browseFarms" && <BrowseFarms goFarm={openFarm} />}
+          {screen === "farmProfile" && (
+            <FarmProfile
+              propertyId={selectedPropertyId}
+              goBooking={() => setScreen("hunterBookingRequest")}
+              goBack={() => setScreen("browseFarms")}
+            />
+          )}
+          {screen === "hunterBookingRequest" && (
+            <HunterBookingRequest
+              propertyId={selectedPropertyId}
+              propertyName={selectedPropertyName || "this farm"}
+              goBack={() => setScreen("farmProfile")}
+            />
           )}
           {screen === "hunterCredentials" && <HunterCredentials />}
           {screen === "news" && <NewsFeed />}

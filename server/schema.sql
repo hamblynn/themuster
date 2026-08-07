@@ -66,7 +66,11 @@ CREATE TABLE properties (
   permitted_hours   TEXT,                        -- e.g. "05:30-09:00,16:00-dusk"
   allow_spotlighting INTEGER NOT NULL DEFAULT 0,  -- boolean 0/1
   exclusivity_mode  TEXT NOT NULL DEFAULT 'shared'
-                    CHECK (exclusivity_mode IN ('shared','exclusive_per_period')),
+                    CHECK (exclusivity_mode IN ('shared','exclusive')),
+  -- Denormalized current exclusivity holder (like hunters.rating_avg is a
+  -- denormalized aggregate) — kept in sync by the exclusivity_requests
+  -- approve/revoke handlers rather than derived via a live join every read.
+  exclusive_hunter_id INTEGER REFERENCES hunters(id) ON DELETE SET NULL,
   active            INTEGER NOT NULL DEFAULT 1,
   -- Circular geofence around (latitude, longitude), used when a booking
   -- opts into geofenced check-in/check-out. Properties vary hugely in
@@ -209,6 +213,25 @@ CREATE TABLE credentials (
 );
 
 -- ------------------------------------------------------------
+-- EXCLUSIVITY REQUESTS
+-- A hunter requests sole standing to book a property (farmer must have
+-- opted the property into exclusivity_mode='exclusive' first). At most
+-- one 'approved' row per property at a time — properties.exclusive_hunter_id
+-- is the fast-access denormalization of "which one, if any."
+-- ------------------------------------------------------------
+CREATE TABLE exclusivity_requests (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  property_id  INTEGER NOT NULL REFERENCES properties(id) ON DELETE CASCADE,
+  hunter_id    INTEGER NOT NULL REFERENCES hunters(id) ON DELETE CASCADE,
+  status       TEXT NOT NULL DEFAULT 'requested'
+               CHECK (status IN ('requested','approved','declined','revoked')),
+  created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+  decided_at   TEXT
+);
+CREATE INDEX idx_exclusivity_requests_property ON exclusivity_requests(property_id);
+CREATE INDEX idx_exclusivity_requests_hunter ON exclusivity_requests(hunter_id);
+
+-- ------------------------------------------------------------
 -- BOOKINGS
 -- ------------------------------------------------------------
 CREATE TABLE bookings (
@@ -220,11 +243,16 @@ CREATE TABLE bookings (
   end_time        TEXT,
   status          TEXT NOT NULL DEFAULT 'requested'
                   CHECK (status IN ('requested','approved','declined','completed','cancelled')),
-  farmer_note     TEXT,     -- e.g. "livestock in north paddock this week"
+  farmer_note     TEXT,     -- e.g. "livestock in north paddock this week" — also reused for a hunter's own note on a hunter-initiated booking
   -- Farmer opts into this per booking (not a fixed property setting) —
   -- the hunter sees it before accepting, per the original ask: "the
   -- hunter can decide if they want to take the booking."
   geofence_required INTEGER NOT NULL DEFAULT 0,
+  -- Who created this booking — determines who must approve/decline it
+  -- vs. who can only cancel it. See allowedBookingTransitions() in
+  -- server.js; without this a farmer (or a hunter, once hunter-initiated
+  -- bookings exist) could self-approve their own request.
+  initiated_by    TEXT NOT NULL DEFAULT 'farmer' CHECK (initiated_by IN ('farmer','hunter')),
   created_at      TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );

@@ -146,12 +146,16 @@ async function offlineQueueAll() {
   });
 }
 
+// Resolves with the item's id (assigned by `put` when new) so a caller
+// that might need to cancel a still-queued item later — an SOS the
+// hunter wants to retract before it ever leaves the device — has
+// something to delete by.
 async function offlineQueuePut(item) {
   const db = await openOfflineQueueDB();
   return new Promise((resolve, reject) => {
     const tx = db.transaction(OFFLINE_QUEUE_STORE, "readwrite");
-    tx.objectStore(OFFLINE_QUEUE_STORE).put(item);
-    tx.oncomplete = () => resolve();
+    const req = tx.objectStore(OFFLINE_QUEUE_STORE).put(item);
+    tx.oncomplete = () => resolve(req.result);
     tx.onerror = () => reject(tx.error);
   });
 }
@@ -181,15 +185,17 @@ async function offlineQueueAddPoints(sessionId, points) {
 }
 
 async function offlineQueueAddOne(kind, sessionId, body) {
-  if (!offlineQueueAvailable()) return;
-  await offlineQueuePut({ kind, session_id: sessionId, body, queued_at: Date.now() });
+  if (!offlineQueueAvailable()) return null;
+  return offlineQueuePut({ kind, session_id: sessionId, body, queued_at: Date.now() });
 }
 
 // Attempts every queued item once, in queued order. Stops at the first
 // network failure (further items would fail identically — no point
 // hammering all of them) but keeps going past a permanent per-item
 // rejection so one bad item can't block everything behind it.
-// `onFlushed(item)` fires for each item that actually sent.
+// `onFlushed(item, responseBody)` fires for each item that actually
+// sent — responseBody matters for 'sos', so the caller can learn the
+// real alert id and still let the hunter cancel it after the fact.
 async function offlineQueueFlush(onFlushed) {
   if (!offlineQueueAvailable()) return 0;
   const items = await offlineQueueAll();
@@ -209,7 +215,10 @@ async function offlineQueueFlush(onFlushed) {
     }
     if (response.ok || response.status < 500) {
       await offlineQueueDelete(item.id);
-      if (response.ok && onFlushed) onFlushed(item);
+      if (response.ok && onFlushed) {
+        const data = await response.json().catch(() => null);
+        onFlushed(item, data);
+      }
     }
     // a 5xx leaves the item queued to retry next cycle
   }
@@ -2722,6 +2731,8 @@ function LiveTracker({ booking, goBack }) {
   const [sosProgress, setSosProgress] = useState(0);
   const [sosSent, setSosSent] = useState(false);
   const [sosQueued, setSosQueued] = useState(false);
+  const [sosAlertId, setSosAlertId] = useState(null); // set once the SOS has actually reached the server
+  const [sosQueueItemId, setSosQueueItemId] = useState(null); // set while it's only sitting in the offline queue
   const [queueSize, setQueueSize] = useState(0);
 
   const watchIdRef = React.useRef(null);
@@ -2795,10 +2806,12 @@ function LiveTracker({ booking, goBack }) {
   // real internet reachability, so a timer that just tries the request
   // is the more honest signal).
   function runFlushQueue() {
-    offlineQueueFlush((item) => {
+    offlineQueueFlush((item, data) => {
       if (item.kind === "sos") {
         setSosSent(true);
         setSosQueued(false);
+        setSosQueueItemId(null);
+        if (data?.id) setSosAlertId(data.id);
       }
     }).then(setQueueSize);
   }
@@ -2923,10 +2936,13 @@ function LiveTracker({ booking, goBack }) {
     const body = { latitude: currentPos[0], longitude: currentPos[1] };
     apiFetch(`/tracking/${session.id}/sos`, { method: "POST", body })
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error("SOS request failed"))))
-      .then(() => setSosSent(true))
+      .then((alert) => {
+        setSosSent(true);
+        setSosAlertId(alert.id);
+      })
       .catch((e) => {
         if (e instanceof TypeError) {
-          offlineQueueAddOne("sos", session.id, body).then(runFlushQueue);
+          offlineQueueAddOne("sos", session.id, body).then(setSosQueueItemId);
           setSosQueued(true);
           setError(null);
           setQueueSize((n) => n + 1);
@@ -2934,6 +2950,26 @@ function LiveTracker({ booking, goBack }) {
           setError("Could not send SOS — check your connection and try again.");
         }
       });
+  }
+
+  // Clears a false alarm or a hold-to-activate that fired unintentionally
+  // — resolves it server-side if it already sent, or just deletes it from
+  // the offline queue if it never left the device.
+  function cancelSos() {
+    if (sosAlertId) {
+      apiFetch(`/sos/${sosAlertId}`, { method: "PATCH" })
+        .then(() => {
+          setSosSent(false);
+          setSosAlertId(null);
+        })
+        .catch(() => {});
+    } else if (sosQueueItemId != null) {
+      offlineQueueDelete(sosQueueItemId).then(() => {
+        setSosQueued(false);
+        setSosQueueItemId(null);
+        setQueueSize((n) => Math.max(0, n - 1));
+      });
+    }
   }
 
   function cancelSosHold() {
@@ -2944,6 +2980,8 @@ function LiveTracker({ booking, goBack }) {
   function startSosHold() {
     setSosSent(false);
     setSosQueued(false);
+    setSosAlertId(null);
+    setSosQueueItemId(null);
     const startedAt = Date.now();
     sosIntervalRef.current = setInterval(() => {
       setSosProgress(Math.min(1, (Date.now() - startedAt) / SOS_HOLD_MS));
@@ -2960,166 +2998,221 @@ function LiveTracker({ booking, goBack }) {
     return <div style={{ ...fontBody, fontSize: 13, color: C.steel }}>No booking selected.</div>;
   }
 
-  return (
-    <div>
-      <button
-        onClick={goBack}
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 4,
-          background: "none",
-          border: "none",
-          padding: 0,
-          marginBottom: 12,
-          ...fontMono,
-          fontSize: 10.5,
-          color: C.steel,
-          cursor: "pointer",
-        }}
-      >
-        <ChevronLeft size={12} /> BACK
-      </button>
+  const backLink = (
+    <button
+      onClick={goBack}
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 4,
+        background: "none",
+        border: "none",
+        padding: 0,
+        ...fontMono,
+        fontSize: 10.5,
+        color: C.steel,
+        cursor: "pointer",
+      }}
+    >
+      <ChevronLeft size={12} /> BACK
+    </button>
+  );
 
-      <div style={{ ...fontDisplay, fontSize: 20, color: C.charcoal }}>{booking.property_name}</div>
-      <div style={{ ...fontBody, fontSize: 12.5, color: C.steel, marginTop: 2, marginBottom: 12 }}>
-        Live tracker — private to you by default. Useful as a reference in the dark, whether or not you
-        choose to share it.
-      </div>
-      <GeofenceStatus booking={{ geofence_required: booking.geofence_required, tracking_session: session }} />
+  const mapView = (
+    <MapContainer
+      center={currentPos || [-37.05, 146.09]}
+      zoom={currentPos ? 16 : 8}
+      style={{ height: "100%", width: "100%" }}
+    >
+      <TileLayer
+        attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+        url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+      />
+      <RecenterOnce position={currentPos} />
+      {points.length > 1 && <Polyline positions={points} pathOptions={{ color: C.eucalyptDeep, weight: 3 }} />}
+      {currentPos && <Marker position={currentPos} />}
+      {tags.map((t) => (
+        <Marker key={t.id} position={[t.latitude, t.longitude]} icon={tagDivIcon(t.tag_type)} />
+      ))}
+    </MapContainer>
+  );
 
-      {queueSize > 0 && (
-        <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 10 }}>
-          <RefreshCw size={12} color={C.gold} />
-          <span style={{ ...fontBody, fontSize: 12, color: C.goldDeep }}>
-            No signal — {queueSize} item{queueSize === 1 ? "" : "s"} saved on this device, will send
-            automatically once you're back in range.
-          </span>
+  // Not actively tracking (not started yet, or just ended) — the normal
+  // in-flow screen. The full-viewport treatment below is only worth it
+  // while GPS is actually live.
+  if (!session || session.ended_at) {
+    return (
+      <div>
+        <div style={{ marginBottom: 12 }}>{backLink}</div>
+
+        <div style={{ ...fontDisplay, fontSize: 20, color: C.charcoal }}>{booking.property_name}</div>
+        <div style={{ ...fontBody, fontSize: 12.5, color: C.steel, marginTop: 2, marginBottom: 12 }}>
+          Live tracker — private to you by default. Useful as a reference in the dark, whether or not you
+          choose to share it.
         </div>
-      )}
+        <GeofenceStatus booking={{ geofence_required: booking.geofence_required, tracking_session: session }} />
 
-      {error && <div style={{ ...fontBody, fontSize: 12.5, color: C.rust, marginBottom: 10 }}>{error}</div>}
+        {error && <div style={{ ...fontBody, fontSize: 12.5, color: C.rust, marginBottom: 10 }}>{error}</div>}
 
-      {!session && (
-        <div style={{ textAlign: "center", padding: "24px 0" }}>
-          <PrimaryButton icon={Navigation} onClick={startTracking}>
-            {starting ? "Starting…" : "Start tracking"}
-          </PrimaryButton>
-        </div>
-      )}
-
-      {session && (
-        <>
-          <div style={{ borderRadius: 12, overflow: "hidden", border: `1px solid ${C.line}`, marginBottom: 12 }}>
-            <MapContainer
-              center={currentPos || [-37.05, 146.09]}
-              zoom={currentPos ? 16 : 8}
-              style={{ height: 320, width: "100%" }}
-            >
-              <TileLayer
-                attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-                url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-              />
-              <RecenterOnce position={currentPos} />
-              {points.length > 1 && (
-                <Polyline positions={points} pathOptions={{ color: C.eucalyptDeep, weight: 3 }} />
-              )}
-              {currentPos && <Marker position={currentPos} />}
-              {tags.map((t) => (
-                <Marker key={t.id} position={[t.latitude, t.longitude]} icon={tagDivIcon(t.tag_type)} />
-              ))}
-            </MapContainer>
+        {!session && (
+          <div style={{ textAlign: "center", padding: "24px 0" }}>
+            <PrimaryButton icon={Navigation} onClick={startTracking}>
+              {starting ? "Starting…" : "Start tracking"}
+            </PrimaryButton>
           </div>
+        )}
 
-          {!session.ended_at && (
-            <>
-              <div style={{ marginBottom: 12 }}>
-                <Checkbox
-                  label="Share live location with farmer"
-                  checked={!!session.share_with_farmer}
-                  onChange={toggleShare}
-                />
-              </div>
-
-              <SectionLabel>Tag this spot</SectionLabel>
-              <TextField
-                label="NOTE (OPTIONAL)"
-                value={noteDraft}
-                onChange={setNoteDraft}
-                placeholder="e.g. Sambar stag, good condition"
-              />
-              <div style={{ display: "flex", gap: 8, marginTop: 8, marginBottom: 16, flexWrap: "wrap" }}>
-                {TRACK_TAG_TYPES.map((t) => (
-                  <GhostButton key={t.value} icon={Crosshair} onClick={() => addTag(t.value)}>
-                    {t.label}
-                  </GhostButton>
-                ))}
-              </div>
-
-              <Divider />
-              <SectionLabel>Emergency</SectionLabel>
-              <div style={{ ...fontBody, fontSize: 12, color: C.steel, marginBottom: 10 }}>
-                Hold the button for two seconds to alert the farmer and any nearby opted-in hunters.
-              </div>
-              <button
-                onPointerDown={startSosHold}
-                onPointerUp={cancelSosHold}
-                onPointerLeave={cancelSosHold}
-                style={{
-                  position: "relative",
-                  width: "100%",
-                  padding: "16px 0",
-                  borderRadius: 10,
-                  border: "none",
-                  background: C.rust,
-                  color: C.white,
-                  cursor: "pointer",
-                  overflow: "hidden",
-                  ...fontBody,
-                  fontWeight: 700,
-                  fontSize: 14,
-                }}
-              >
-                <div
-                  style={{
-                    position: "absolute",
-                    inset: 0,
-                    left: 0,
-                    width: `${sosProgress * 100}%`,
-                    background: "rgba(255,255,255,0.28)",
-                    transition: sosProgress === 0 ? "width 0.15s ease-out" : "none",
-                  }}
-                />
-                <span style={{ position: "relative", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
-                  <Siren size={16} /> HOLD FOR SOS
-                </span>
-              </button>
-              {sosQueued && (
-                <div style={{ ...fontBody, fontSize: 12.5, color: C.rust, marginTop: 8, textAlign: "center" }}>
-                  No signal — SOS saved on this device and will send the moment you're back in range.
-                  Keep this screen open.
-                </div>
-              )}
-              {sosSent && !sosQueued && (
-                <div style={{ ...fontBody, fontSize: 12.5, color: C.rust, marginTop: 8, textAlign: "center" }}>
-                  SOS sent — the farmer and any nearby opted-in hunters have been alerted.
-                </div>
-              )}
-
-              <Divider />
-              <GhostButton full tone="rust" onClick={stopTracking}>
-                End tracking
-              </GhostButton>
-            </>
-          )}
-
-          {session.ended_at && (
+        {session?.ended_at && (
+          <>
+            <div style={{ borderRadius: 12, overflow: "hidden", border: `1px solid ${C.line}`, marginBottom: 12, height: 320 }}>
+              {mapView}
+            </div>
             <div style={{ ...fontBody, fontSize: 12.5, color: C.steel, textAlign: "center", padding: "12px 0" }}>
               Tracking ended. {tags.length} tag{tags.length === 1 ? "" : "s"} recorded.
             </div>
+          </>
+        )}
+      </div>
+    );
+  }
+
+  // Actively tracking — the map fills the whole screen (this is the
+  // hunter's primary view in the field, not a small box in a scrolling
+  // page); back/status float over the top and the tag/SOS/end-tracking
+  // controls float over the bottom, both above Leaflet's own controls
+  // (its zoom buttons sit at z-index 1000 inside the map).
+  return (
+    <div style={{ position: "fixed", inset: 0, zIndex: 50, background: C.paper }}>
+      {mapView}
+
+      <div
+        style={{
+          position: "absolute",
+          top: 0,
+          left: 0,
+          right: 0,
+          zIndex: 1001,
+          padding: "calc(10px + env(safe-area-inset-top)) 14px 10px",
+          background: "rgba(246,243,236,0.94)",
+          backdropFilter: "blur(6px)",
+          WebkitBackdropFilter: "blur(6px)",
+        }}
+      >
+        {backLink}
+        <div style={{ ...fontDisplay, fontSize: 17, color: C.charcoal, marginTop: 4 }}>{booking.property_name}</div>
+        <div style={{ marginTop: 4 }}>
+          <GeofenceStatus booking={{ geofence_required: booking.geofence_required, tracking_session: session }} />
+        </div>
+        {queueSize > 0 && (
+          <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 6 }}>
+            <RefreshCw size={12} color={C.gold} />
+            <span style={{ ...fontBody, fontSize: 11.5, color: C.goldDeep }}>
+              No signal — {queueSize} item{queueSize === 1 ? "" : "s"} saved, will send once you're back in
+              range.
+            </span>
+          </div>
+        )}
+        {error && <div style={{ ...fontBody, fontSize: 11.5, color: C.rust, marginTop: 6 }}>{error}</div>}
+      </div>
+
+      <div
+        style={{
+          position: "absolute",
+          bottom: 0,
+          left: 0,
+          right: 0,
+          zIndex: 1001,
+          maxHeight: "60vh",
+          overflowY: "auto",
+          background: C.paper,
+          borderTopLeftRadius: 16,
+          borderTopRightRadius: 16,
+          boxShadow: "0 -6px 20px rgba(0,0,0,0.15)",
+          padding: "14px 16px calc(14px + env(safe-area-inset-bottom))",
+        }}
+      >
+        <Checkbox
+          label="Share live location with farmer"
+          checked={!!session.share_with_farmer}
+          onChange={toggleShare}
+        />
+
+        <div style={{ marginTop: 10 }}>
+          <TextField
+            label="TAG A SPOT (OPTIONAL NOTE)"
+            value={noteDraft}
+            onChange={setNoteDraft}
+            placeholder="e.g. Sambar stag"
+          />
+        </div>
+        <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+          {TRACK_TAG_TYPES.map((t) => (
+            <GhostButton key={t.value} icon={Crosshair} onClick={() => addTag(t.value)}>
+              {t.label}
+            </GhostButton>
+          ))}
+        </div>
+
+        <div style={{ borderTop: `1px solid ${C.line}`, marginTop: 12, paddingTop: 12 }}>
+          <button
+            onPointerDown={startSosHold}
+            onPointerUp={cancelSosHold}
+            onPointerLeave={cancelSosHold}
+            style={{
+              position: "relative",
+              width: "100%",
+              padding: "13px 0",
+              borderRadius: 10,
+              border: "none",
+              background: C.rust,
+              color: C.white,
+              cursor: "pointer",
+              overflow: "hidden",
+              ...fontBody,
+              fontWeight: 700,
+              fontSize: 14,
+            }}
+          >
+            <div
+              style={{
+                position: "absolute",
+                inset: 0,
+                left: 0,
+                width: `${sosProgress * 100}%`,
+                background: "rgba(255,255,255,0.28)",
+                transition: sosProgress === 0 ? "width 0.15s ease-out" : "none",
+              }}
+            />
+            <span style={{ position: "relative", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+              <Siren size={16} /> HOLD 2s FOR SOS
+            </span>
+          </button>
+          {sosQueued && (
+            <div style={{ ...fontBody, fontSize: 12, color: C.rust, marginTop: 8, textAlign: "center" }}>
+              No signal — SOS saved on this device and will send the moment you're back in range. Keep this
+              screen open.
+            </div>
           )}
-        </>
-      )}
+          {sosSent && !sosQueued && (
+            <div style={{ ...fontBody, fontSize: 12, color: C.rust, marginTop: 8, textAlign: "center" }}>
+              SOS sent — the farmer and any nearby opted-in hunters have been alerted.
+            </div>
+          )}
+          {(sosSent || sosQueued) && (
+            <div style={{ textAlign: "center", marginTop: 8 }}>
+              <GhostButton icon={X} onClick={cancelSos}>
+                Cancel SOS
+              </GhostButton>
+            </div>
+          )}
+        </div>
+
+        <div style={{ marginTop: 12 }}>
+          <GhostButton full tone="rust" onClick={stopTracking}>
+            End tracking
+          </GhostButton>
+        </div>
+      </div>
     </div>
   );
 }

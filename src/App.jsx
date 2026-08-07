@@ -1185,13 +1185,13 @@ function LandingPage({ goLogin, goFarmerSignup, goHunterSignup }) {
    SCREEN 1 — FARMER DASHBOARD (matched hunters for a property)
 --------------------------------------------------------- */
 function FarmerDashboard({ goRefer, goProfile, goListProperty, goEditProperty }) {
-  const { user } = useAuth();
+  const { user, activeProperty, selectProperty } = useAuth();
   const [property, setProperty] = useState(null);
   const [hunters, setHunters] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
-  const myProperty = user?.properties?.[0];
+  const myProperty = activeProperty;
 
   React.useEffect(() => {
     if (!myProperty) {
@@ -1258,8 +1258,31 @@ function FarmerDashboard({ goRefer, goProfile, goListProperty, goEditProperty })
   return (
     <div>
       <EnableAlertsBanner />
+      {user.properties.length > 1 && (
+        <div style={{ marginBottom: 10 }}>
+          <PropertySwitcher properties={user.properties} activeId={myProperty.id} onSelect={selectProperty} />
+        </div>
+      )}
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end" }}>
         <div>
+          <button
+            onClick={goListProperty}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 4,
+              background: "none",
+              border: "none",
+              padding: 0,
+              marginBottom: 6,
+              ...fontMono,
+              fontSize: 10.5,
+              color: C.eucalyptDeep,
+              cursor: "pointer",
+            }}
+          >
+            <Home size={11} /> + ADD ANOTHER PROPERTY
+          </button>
           <div style={{ ...fontMono, fontSize: 11, color: C.steel, letterSpacing: 0.5, marginBottom: 4 }}>
             PROPERTY · PIC {property.pic_code}
             {property.lot_number && property.plan_number
@@ -1409,12 +1432,12 @@ const CREDENTIAL_LABELS = {
 };
 
 function HunterProfile({ hunterId, goBooking, goBack }) {
-  const { user } = useAuth();
+  const { user, activeProperty } = useAuth();
   const [hunter, setHunter] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
-  const nearPropertyId = user?.role === "farmer" ? user?.properties?.[0]?.id : null;
+  const nearPropertyId = user?.role === "farmer" ? activeProperty?.id : null;
 
   React.useEffect(() => {
     if (!hunterId) return;
@@ -1645,8 +1668,8 @@ function nextDates(count) {
 }
 
 function BookingRequest({ hunterId, hunterName, goBack, goMessages }) {
-  const { user } = useAuth();
-  const myProperty = user?.properties?.[0];
+  const { user, activeProperty } = useAuth();
+  const myProperty = activeProperty;
   const dateOptions = nextDates(21);
   const [selectedDate, setSelectedDate] = useState(dateOptions[0]);
   const [hunter, setHunter] = useState(null);
@@ -2716,6 +2739,34 @@ function ViewModeToggle({ viewMode, onChange }) {
         >
           <Icon size={12} />
           {label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// Same pill-row pattern as ViewModeToggle above — only rendered by
+// callers when a farmer has more than one property.
+function PropertySwitcher({ properties, activeId, onSelect }) {
+  return (
+    <div style={{ display: "flex", gap: 4, background: C.paperDim, borderRadius: 8, padding: 3, flexWrap: "wrap" }}>
+      {properties.map((p) => (
+        <button
+          key={p.id}
+          onClick={() => onSelect(p.id)}
+          style={{
+            border: "none",
+            borderRadius: 6,
+            padding: "6px 10px",
+            cursor: "pointer",
+            background: p.id === activeId ? C.white : "transparent",
+            boxShadow: p.id === activeId ? "0 1px 2px rgba(0,0,0,0.08)" : "none",
+            ...fontMono,
+            fontSize: 10.5,
+            color: p.id === activeId ? C.charcoal : C.steel,
+          }}
+        >
+          {p.name}
         </button>
       ))}
     </div>
@@ -3894,7 +3945,7 @@ function ReviewForm({ booking, onSubmitted }) {
    and — once completed — leaving a review of the hunter.
 --------------------------------------------------------- */
 function FarmerBookings({ goMessages, goTrackingView }) {
-  const { user } = useAuth();
+  const { user, activeProperty } = useAuth();
   const [bookings, setBookings] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -3998,9 +4049,12 @@ function FarmerBookings({ goMessages, goTrackingView }) {
         <BookingCalendar
           bookings={bookings}
           getLabel={(b) => b.hunter_name}
+          // Bookings can span more than one of the farmer's properties;
+          // this just anchors the forecast to whichever one is active,
+          // an approximation rather than a per-booking weather lookup.
           weatherLocation={{
-            latitude: user?.properties?.[0]?.latitude,
-            longitude: user?.properties?.[0]?.longitude,
+            latitude: activeProperty?.latitude,
+            longitude: activeProperty?.longitude,
           }}
         />
       )}
@@ -4266,8 +4320,8 @@ function ReferNeighbour({ hunterId, hunterName, goBack }) {
    SCREEN 9 — EDIT PROPERTY (farmer updates their own listing)
 --------------------------------------------------------- */
 function EditProperty({ goBack, onSaved }) {
-  const { user, updateProperty } = useAuth();
-  const myProperty = user?.properties?.[0];
+  const { user, activeProperty, selectProperty, updateProperty } = useAuth();
+  const myProperty = activeProperty;
 
   const [loaded, setLoaded] = useState(false);
   const [name, setName] = useState("");
@@ -4313,6 +4367,14 @@ function EditProperty({ goBack, onSaved }) {
 
   React.useEffect(() => {
     if (!myProperty) return;
+    // Reset per-load state — this effect can now re-fire mid-mount when
+    // a farmer with multiple properties switches the active one, and
+    // without this the form would flash the *previous* property's
+    // values until each field setter below overwrites them one by one.
+    setLoaded(false);
+    setSaved(false);
+    setSaveError(null);
+    setLoadError(null);
     apiFetch(`/properties/${myProperty.id}`)
       .then((r) => {
         if (!r.ok) throw new Error("Could not load property");
@@ -4537,7 +4599,14 @@ function EditProperty({ goBack, onSaved }) {
         <ChevronLeft size={13} /> BACK TO DASHBOARD
       </button>
 
-      <div style={{ ...fontDisplay, fontSize: 22, color: C.charcoal }}>Edit property details</div>
+      {user.properties.length > 1 && (
+        <div style={{ marginBottom: 10 }}>
+          <PropertySwitcher properties={user.properties} activeId={myProperty.id} onSelect={selectProperty} />
+        </div>
+      )}
+      <div style={{ ...fontDisplay, fontSize: 22, color: C.charcoal }}>
+        Edit property details — {myProperty.name}
+      </div>
 
       <Divider />
       <SectionLabel>Property details</SectionLabel>
@@ -4803,7 +4872,8 @@ function EditProperty({ goBack, onSaved }) {
    SCREEN 5 — FARMER SIGN-UP (add farmer + property)
 --------------------------------------------------------- */
 function FarmerSignup({ goDashboard, goBack }) {
-  const { login } = useAuth();
+  const { user, login, updateProperty, selectProperty } = useAuth();
+  const alreadyLoggedIn = user?.role === "farmer";
   const [farmerName, setFarmerName] = useState("");
   const [farmerEmail, setFarmerEmail] = useState("");
   const [farmerPhone, setFarmerPhone] = useState("");
@@ -4827,13 +4897,54 @@ function FarmerSignup({ goDashboard, goBack }) {
   const [error, setError] = useState(null);
   const [done, setDone] = useState(null);
 
+  function propertyBody() {
+    return {
+      name: propertyName,
+      pic_code: picCode,
+      lot_number: lotNumber,
+      plan_number: planNumber,
+      address, suburb,
+      latitude: parseFloat(latitude),
+      longitude: parseFloat(longitude),
+      size_hectares: sizeHa ? parseFloat(sizeHa) : null,
+      access_notes: accessNotes,
+      permitted_hours: permittedHours,
+      allow_spotlighting: allowSpotlighting,
+      ownership_document_url: ownershipDocumentUrl,
+      no_go_zones: noGoLabel ? [{ label: noGoLabel, description: noGoDescription }] : [],
+    };
+  }
+
   function submit() {
-    if (!farmerName || !farmerEmail || !password || !propertyName || !picCode || !latitude || !longitude) {
-      setError("Name, email, password, property name, PIC and coordinates are required.");
+    if (!propertyName || !picCode || !latitude || !longitude) {
+      setError("Property name, PIC and coordinates are required.");
+      return;
+    }
+    if (!alreadyLoggedIn && (!farmerName || !farmerEmail || !password)) {
+      setError("Name, email and password are required.");
       return;
     }
     setSubmitting(true);
     setError(null);
+
+    if (alreadyLoggedIn) {
+      // Already have a session — just add the property to it, no
+      // re-registration (which would 400 on the duplicate email anyway).
+      apiFetch("/properties", { method: "POST", body: propertyBody() })
+        .then((r) => {
+          if (!r.ok) return r.json().then((e) => Promise.reject(new Error(e.error)));
+          return r.json();
+        })
+        .then((property) => {
+          updateProperty(property);
+          selectProperty(property.id);
+          setDone(property);
+        })
+        .catch((e) => setError(e.message))
+        .finally(() => setSubmitting(false));
+      return;
+    }
+
     apiFetch("/auth/farmer/register", {
       method: "POST",
       body: { name: farmerName, email: farmerEmail, phone: farmerPhone, password },
@@ -4843,24 +4954,7 @@ function FarmerSignup({ goDashboard, goBack }) {
         return r.json();
       })
       .then(({ user }) =>
-        apiFetch("/properties", {
-          method: "POST",
-          body: {
-            name: propertyName,
-            pic_code: picCode,
-            lot_number: lotNumber,
-            plan_number: planNumber,
-            address, suburb,
-            latitude: parseFloat(latitude),
-            longitude: parseFloat(longitude),
-            size_hectares: sizeHa ? parseFloat(sizeHa) : null,
-            access_notes: accessNotes,
-            permitted_hours: permittedHours,
-            allow_spotlighting: allowSpotlighting,
-            ownership_document_url: ownershipDocumentUrl,
-            no_go_zones: noGoLabel ? [{ label: noGoLabel, description: noGoDescription }] : [],
-          },
-        }).then((r) => {
+        apiFetch("/properties", { method: "POST", body: propertyBody() }).then((r) => {
           if (!r.ok) return r.json().then((e) => Promise.reject(new Error(e.error)));
           return r.json();
         }).then((property) => ({ user, property }))
@@ -4878,10 +4972,14 @@ function FarmerSignup({ goDashboard, goBack }) {
       <div>
         <div style={{ display: "flex", alignItems: "center", gap: 8, color: C.eucalyptDeep }}>
           <Check size={18} />
-          <span style={{ ...fontBody, fontWeight: 700, fontSize: 15 }}>Account created & property listed</span>
+          <span style={{ ...fontBody, fontWeight: 700, fontSize: 15 }}>
+            {alreadyLoggedIn ? "Property added" : "Account created & property listed"}
+          </span>
         </div>
         <div style={{ ...fontBody, fontSize: 13, color: C.bark, marginTop: 6 }}>
-          {done.name} (PIC {done.pic_code}) is now live and you're logged in.
+          {alreadyLoggedIn
+            ? `${done.name} (PIC ${done.pic_code}) is now live on your account.`
+            : `${done.name} (PIC ${done.pic_code}) is now live and you're logged in.`}
         </div>
         <div style={{ marginTop: 14 }}>
           <PrimaryButton full onClick={goDashboard}>Go to your dashboard</PrimaryButton>
@@ -4912,19 +5010,27 @@ function FarmerSignup({ goDashboard, goBack }) {
           <ChevronLeft size={12} /> BACK
         </button>
       )}
-      <div style={{ ...fontDisplay, fontSize: 22, color: C.charcoal }}>List a property</div>
+      <div style={{ ...fontDisplay, fontSize: 22, color: C.charcoal }}>
+        {alreadyLoggedIn ? "Add another property" : "List a property"}
+      </div>
       <div style={{ ...fontBody, fontSize: 13, color: C.steel, marginTop: 2 }}>
-        For farmers — tell us about you and the property.
+        {alreadyLoggedIn
+          ? "Adds a new property to your existing account."
+          : "For farmers — tell us about you and the property."}
       </div>
 
-      <Divider />
-      <SectionLabel>Your details</SectionLabel>
-      <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-        <TextField label="FULL NAME" value={farmerName} onChange={setFarmerName} placeholder="Nathan Hambly" />
-        <TextField label="EMAIL" value={farmerEmail} onChange={setFarmerEmail} placeholder="you@example.com" />
-        <TextField label="MOBILE" value={farmerPhone} onChange={setFarmerPhone} placeholder="0400 000 000" />
-        <TextField label="PASSWORD" value={password} onChange={setPassword} placeholder="At least 8 characters" type="password" />
-      </div>
+      {!alreadyLoggedIn && (
+        <>
+          <Divider />
+          <SectionLabel>Your details</SectionLabel>
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            <TextField label="FULL NAME" value={farmerName} onChange={setFarmerName} placeholder="Nathan Hambly" />
+            <TextField label="EMAIL" value={farmerEmail} onChange={setFarmerEmail} placeholder="you@example.com" />
+            <TextField label="MOBILE" value={farmerPhone} onChange={setFarmerPhone} placeholder="0400 000 000" />
+            <TextField label="PASSWORD" value={password} onChange={setPassword} placeholder="At least 8 characters" type="password" />
+          </div>
+        </>
+      )}
 
       <Divider />
       <SectionLabel>Property details</SectionLabel>
@@ -6923,6 +7029,15 @@ function PwaUpdateToast() {
 export default function App() {
   const [user, setUser] = useState(null);
   const [rehydrating, setRehydrating] = useState(true);
+  const [activePropertyId, setActivePropertyId] = useState(null);
+
+  // Derived, not synced — properties.id is a single global auto-increment
+  // PK (not scoped per farmer), so a stale id left over from a previous
+  // session can never accidentally match a different farmer's property;
+  // it just falls through to properties[0] correctly. No need to reset
+  // this on every login.
+  const activeProperty =
+    user?.properties?.find((p) => p.id === activePropertyId) || user?.properties?.[0] || null;
 
   // On first load, ask the server whether the session cookie (if any) is
   // still valid — there's nothing client-side to read, the cookie is
@@ -6943,11 +7058,21 @@ export default function App() {
   }
   function logout() {
     apiFetch("/auth/logout", { method: "POST" }).finally(() => setUser(null));
+    setActivePropertyId(null);
   }
+  // Merges by id rather than always overwriting index 0 — handles both
+  // "farmer edited an existing property" (replace matching id) and
+  // "farmer just added a new one" (id not found yet, append) with the
+  // same function.
   function updateProperty(updatedProperty) {
-    setUser((prev) =>
-      prev ? { ...prev, properties: [updatedProperty, ...(prev.properties || []).slice(1)] } : prev
-    );
+    setUser((prev) => {
+      if (!prev) return prev;
+      const exists = (prev.properties || []).some((p) => p.id === updatedProperty.id);
+      const properties = exists
+        ? prev.properties.map((p) => (p.id === updatedProperty.id ? updatedProperty : p))
+        : [...(prev.properties || []), updatedProperty];
+      return { ...prev, properties };
+    });
   }
   function updateSelf(updatedUser) {
     setUser(updatedUser);
@@ -6962,7 +7087,9 @@ export default function App() {
   }
 
   return (
-    <AuthContext.Provider value={{ user, login, logout, updateProperty, updateSelf }}>
+    <AuthContext.Provider
+      value={{ user, login, logout, updateProperty, updateSelf, activeProperty, selectProperty: setActivePropertyId }}
+    >
       <SosActiveBanner />
       <AppShell />
       <PwaUpdateToast />

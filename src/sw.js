@@ -6,6 +6,19 @@ import { precacheAndRoute } from "workbox-precaching";
 
 precacheAndRoute(self.__WB_MANIFEST);
 
+// injectManifest mode (unlike the default generateSW) doesn't wire this
+// up automatically. Without it, the "Update" button in PwaUpdateToast
+// calls updateServiceWorker(true), which posts this message to the
+// waiting worker expecting it to skipWaiting() and take over — but
+// nothing here was listening, so the waiting worker never activated,
+// controllerchange never fired, and the page never reloaded. Clicking
+// Update looked like it did nothing.
+self.addEventListener("message", (event) => {
+  if (event.data?.type === "SKIP_WAITING") {
+    self.skipWaiting();
+  }
+});
+
 // Same env var the main app uses for its API base (src/App.jsx) — Vite
 // replaces import.meta.env.* at build time in the service worker bundle
 // too, since injectManifest runs src/sw.js through Vite's own build.

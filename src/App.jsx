@@ -75,6 +75,12 @@ const fontDisplay = { fontFamily: "'Fraunces', ui-serif, Georgia, serif" };
 const fontBody = { fontFamily: "'IBM Plex Sans', ui-sans-serif, system-ui" };
 const fontMono = { fontFamily: "'IBM Plex Mono', ui-monospace, monospace" };
 
+// Shared between the app shell and the logged-out landing page, which
+// renders outside the shell's own <style> tag — ital axis included for
+// the landing hero's italic headline.
+const GOOGLE_FONTS_IMPORT =
+  "@import url('https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,500;0,9..144,600;1,9..144,500;1,9..144,600&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap');";
+
 // Node backend (see /server) — run `npm run seed && npm start` in that folder.
 // Locally this defaults to localhost. Deployed, VITE_API_BASE is set to the
 // relative path "/api" — vercel.json rewrites /api/* to the Render backend,
@@ -1104,46 +1110,299 @@ function PerspectiveList({ title, Icon, accent, items }) {
   );
 }
 
-function LandingPage({ goLogin, goFarmerSignup, goHunterSignup }) {
+// The logged-out landing page — the one screen in the app given the
+// full "marketing site" treatment (full-bleed hero, editorial serif
+// headline). Deliberately not the style of the functional screens
+// below: those are a working tool used in the field, this is the
+// sales pitch a first-time visitor sees before they've ever logged
+// in. Renders full-width, outside AppShell's centered container.
+function LandingHero({ goLogin, goFarmerSignup, goHunterSignup, goAdmin }) {
+  const heroBtnPrimary = {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 8,
+    padding: "12px 20px",
+    borderRadius: 8,
+    border: "none",
+    background: C.paper,
+    color: C.charcoal,
+    ...fontBody,
+    fontWeight: 600,
+    fontSize: 13.5,
+    cursor: "pointer",
+  };
+  const heroBtnGhost = {
+    ...heroBtnPrimary,
+    background: "transparent",
+    color: C.white,
+    border: "1.5px solid rgba(255,253,248,0.55)",
+  };
+  const navLink = {
+    ...fontBody,
+    fontSize: 13,
+    color: C.bark,
+    textDecoration: "none",
+    background: "none",
+    border: "none",
+    cursor: "pointer",
+    padding: 0,
+  };
+
   return (
-    <div>
-      <div style={{ textAlign: "center", padding: "6px 4px 26px" }}>
-        <div style={{ ...fontMono, fontSize: 10.5, color: C.goldDeep, letterSpacing: 1.6, marginBottom: 10 }}>
-          VIC · ACCREDITED VERMIN CONTROL
-        </div>
-        <h1
+    <div style={{ ...fontBody, background: C.paper, minHeight: "100vh" }}>
+      <style>{`
+        ${GOOGLE_FONTS_IMPORT}
+        * { box-sizing: border-box; }
+        html { scroll-behavior: smooth; }
+        .muster-hero-nav-links { display: none; }
+        .muster-hero-float-card { display: none; }
+        .muster-hero-headline { font-size: clamp(34px, 7vw, 58px); }
+        @media (min-width: 760px) {
+          .muster-hero-nav-links { display: flex; }
+          .muster-hero-float-card { display: block; }
+        }
+        .muster-hero-cta-btn:hover { opacity: 0.88; }
+        .muster-trust-grid { display: flex; flex-direction: column; gap: 22px; }
+        @media (min-width: 720px) {
+          .muster-trust-grid { flex-direction: row; }
+        }
+      `}</style>
+
+      {/* NAV */}
+      <div
+        style={{
+          position: "sticky",
+          top: 0,
+          zIndex: 20,
+          background: "rgba(246,243,236,0.92)",
+          backdropFilter: "blur(6px)",
+          WebkitBackdropFilter: "blur(6px)",
+          borderBottom: `1px solid ${C.line}`,
+        }}
+      >
+        <div
           style={{
-            ...fontDisplay,
-            fontSize: 28,
-            fontWeight: 600,
-            color: C.charcoal,
-            margin: "0 0 12px",
-            lineHeight: 1.2,
+            maxWidth: 1180,
+            margin: "0 auto",
+            padding: "14px 20px",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 16,
           }}
         >
-          Connecting farmers with licensed hunters
-        </h1>
-        <p style={{ ...fontBody, fontSize: 13.5, color: C.steel, lineHeight: 1.6, maxWidth: 440, margin: "0 auto" }}>
-          The Muster matches Victorian landholders carrying deer, fox, rabbit and other pest pressure with
-          vetted, accredited hunters ready to help control it — safely, on your terms.
-        </p>
-        <div style={{ display: "flex", gap: 10, justifyContent: "center", flexWrap: "wrap", marginTop: 22 }}>
-          <PrimaryButton icon={LogIn} onClick={goLogin}>Log in</PrimaryButton>
-          <GhostButton icon={Home} onClick={goFarmerSignup}>List a property</GhostButton>
-          <GhostButton icon={UserCheck} onClick={goHunterSignup}>Become a hunter</GhostButton>
+          <span style={{ ...fontDisplay, fontSize: 19, fontWeight: 600, color: C.charcoal, flexShrink: 0 }}>
+            The Muster
+          </span>
+          <div style={{ display: "flex", alignItems: "center", gap: 22 }}>
+            <div className="muster-hero-nav-links" style={{ alignItems: "center", gap: 22 }}>
+              <a href="#how-it-works" style={navLink}>How it works</a>
+              <a href="#safety" style={navLink}>Safety &amp; trust</a>
+              <a href="#about" style={navLink}>About</a>
+              <button onClick={goAdmin} style={{ ...navLink, color: C.steel, fontSize: 11 }}>
+                Admin
+              </button>
+            </div>
+            <button onClick={goLogin} style={navLink}>Log in</button>
+            <button
+              onClick={goFarmerSignup}
+              className="muster-hero-cta-btn"
+              style={{
+                ...fontBody,
+                fontSize: 12.5,
+                fontWeight: 600,
+                color: C.white,
+                background: C.eucalyptDeep,
+                border: "none",
+                borderRadius: 8,
+                padding: "9px 16px",
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 6,
+                cursor: "pointer",
+              }}
+            >
+              Join The Muster <ChevronRight size={13} />
+            </button>
+          </div>
         </div>
       </div>
 
+      {/* HERO */}
+      <div
+        style={{
+          position: "relative",
+          overflow: "hidden",
+          background: `linear-gradient(115deg, ${C.charcoal} 0%, #3B4A38 42%, #6E5A2E 78%, ${C.gold} 100%)`,
+        }}
+      >
+        {/* decorative rolling-hill silhouette — CSS/SVG only, no external image */}
+        <svg
+          viewBox="0 0 1200 300"
+          preserveAspectRatio="none"
+          style={{ position: "absolute", left: 0, right: 0, bottom: -2, width: "100%", height: "34%", opacity: 0.5 }}
+        >
+          <path d="M0,180 C200,120 340,220 560,150 C760,90 900,190 1200,110 L1200,300 L0,300 Z" fill="#232019" />
+          <path d="M0,230 C260,190 420,260 680,210 C880,175 1000,240 1200,200 L1200,300 L0,300 Z" fill="#171410" />
+        </svg>
+        <div
+          style={{
+            position: "absolute",
+            inset: 0,
+            background: "linear-gradient(90deg, rgba(20,18,14,0.72) 0%, rgba(20,18,14,0.38) 55%, rgba(20,18,14,0.08) 100%)",
+          }}
+        />
+
+        <div
+          style={{
+            position: "relative",
+            maxWidth: 1180,
+            margin: "0 auto",
+            padding: "72px 20px 110px",
+          }}
+        >
+          <div style={{ ...fontMono, fontSize: 11, color: "#E7CC8C", letterSpacing: 1.8, marginBottom: 16 }}>
+            — VIC · ACCREDITED VERMIN CONTROL
+          </div>
+          <h1
+            className="muster-hero-headline"
+            style={{
+              ...fontDisplay,
+              fontStyle: "italic",
+              fontWeight: 500,
+              color: C.white,
+              margin: "0 0 18px",
+              lineHeight: 1.08,
+              maxWidth: 640,
+            }}
+          >
+            Good people.
+            <br />
+            Better land.
+          </h1>
+          <p
+            style={{
+              ...fontBody,
+              fontSize: 14.5,
+              color: "rgba(255,253,248,0.85)",
+              lineHeight: 1.6,
+              maxWidth: 460,
+              marginBottom: 28,
+            }}
+          >
+            The Muster matches Victorian landholders carrying deer, fox, rabbit and other pest pressure with
+            vetted, accredited hunters ready to help control it — safely, on your terms.
+          </p>
+          <div id="join" style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 34 }}>
+            <button className="muster-hero-cta-btn" style={heroBtnPrimary} onClick={goFarmerSignup}>
+              I'm a landholder <ChevronRight size={15} />
+            </button>
+            <button className="muster-hero-cta-btn" style={heroBtnGhost} onClick={goHunterSignup}>
+              I'm a hunter
+            </button>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+            <div style={{ display: "flex" }}>
+              {["TR", "JM", "AM"].map((initials, i) => (
+                <div key={initials} style={{ marginLeft: i === 0 ? 0 : -10, border: `2px solid ${C.charcoal}`, borderRadius: "50%" }}>
+                  <Avatar initials={initials} size={34} />
+                </div>
+              ))}
+            </div>
+            <div>
+              <div style={{ ...fontBody, fontSize: 12.5, fontWeight: 600, color: C.white }}>Built around trust</div>
+              <div style={{ ...fontBody, fontSize: 11.5, color: "rgba(255,253,248,0.7)" }}>
+                Credentials verified by real people
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* floating illustrative hunter card — sample content, not a live match */}
+        <div
+          className="muster-hero-float-card"
+          style={{
+            position: "absolute",
+            right: "6%",
+            bottom: 48,
+            width: 250,
+            background: C.white,
+            borderRadius: 14,
+            boxShadow: "0 16px 40px rgba(0,0,0,0.28)",
+            padding: 16,
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 12 }}>
+            <span style={{ width: 7, height: 7, borderRadius: "50%", background: C.eucalypt, display: "inline-block" }} />
+            <span style={{ ...fontMono, fontSize: 9.5, color: C.steel, letterSpacing: 0.6 }}>
+              AVAILABLE NEAR MANSFIELD
+            </span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
+            <Avatar initials="TR" size={38} />
+            <div>
+              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <span style={{ ...fontDisplay, fontSize: 14.5, fontWeight: 600, color: C.charcoal }}>Tom Riordan</span>
+                <span style={{ display: "flex", alignItems: "center", gap: 2, ...fontMono, fontSize: 10.5, color: C.goldDeep }}>
+                  <Star size={10} fill={C.gold} color={C.gold} /> 4.9
+                </span>
+              </div>
+              <div style={{ ...fontBody, fontSize: 11, color: C.steel }}>Accredited field harvester</div>
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: 6, marginBottom: 12, flexWrap: "wrap" }}>
+            <Pill>✓ Licence verified</Pill>
+            <Pill>✓ Fully insured</Pill>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <div>
+              <div style={{ ...fontMono, fontSize: 9, color: C.steel, letterSpacing: 0.4 }}>DISTANCE</div>
+              <div style={{ ...fontBody, fontSize: 12.5, color: C.charcoal, fontWeight: 600 }}>12 km away</div>
+            </div>
+            <ChevronRight size={16} color={C.steel} />
+          </div>
+        </div>
+      </div>
+
+      {/* SAFETY & TRUST STRIP */}
+      <div id="safety" style={{ maxWidth: 1180, margin: "0 auto", padding: "44px 20px" }}>
+        <div className="muster-trust-grid">
+          {[
+            { Icon: Check, title: "Verified people", body: "Licences, insurance and credentials checked before a hunter appears." },
+            { Icon: MapPin, title: "Your land, your rules", body: "Set species, access hours and no-go zones before anyone arrives." },
+            { Icon: ShieldCheck, title: "Safer in the field", body: "Geofenced check-ins, live tracking and SOS support for every visit." },
+          ].map((f) => (
+            <div key={f.title} style={{ flex: 1, display: "flex", gap: 12 }}>
+              <div
+                style={{
+                  width: 34, height: 34, borderRadius: 9, background: C.mist,
+                  display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0,
+                }}
+              >
+                <f.Icon size={17} color={C.eucalyptDeep} />
+              </div>
+              <div>
+                <div style={{ ...fontBody, fontSize: 14, fontWeight: 600, color: C.charcoal, marginBottom: 3 }}>
+                  {f.title}
+                </div>
+                <div style={{ ...fontBody, fontSize: 12.5, color: C.steel, lineHeight: 1.5 }}>{f.body}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* SPECIES */}
       <div
         style={{
           display: "flex",
           justifyContent: "center",
           gap: 16,
           flexWrap: "wrap",
-          padding: "20px 8px",
+          maxWidth: 1180,
+          margin: "0 auto",
+          padding: "20px 20px 36px",
           borderTop: `1px solid ${C.line}`,
-          borderBottom: `1px solid ${C.line}`,
-          marginBottom: 26,
         }}
       >
         {GAME_SPECIES_GRAPHICS.map((s) => (
@@ -1151,33 +1410,72 @@ function LandingPage({ goLogin, goFarmerSignup, goHunterSignup }) {
         ))}
       </div>
 
-      <div className="muster-two-col" style={{ marginBottom: 22 }}>
-        <PerspectiveList
-          title="For farmers"
-          Icon={Home}
-          accent={C.eucalyptDeep}
-          items={[
-            "List your property, define access rules, no-go zones and permitted hunting hours.",
-            "Choose which species you'll allow — deer, fox, rabbit, hare, wild dog, kangaroo and wombat, with ATCW permits tracked for you.",
-            "Browse hunters matched by distance, with verified credentials shown up front.",
-            "Approve or decline booking requests and message hunters directly.",
-            "See harvest declarations and leave a review after each visit.",
-            "Track regional pest pressure from sightings reported nearby.",
-          ]}
-        />
-        <PerspectiveList
-          title="For hunters"
-          Icon={UserCheck}
-          accent={C.goldDeep}
-          items={[
-            "Submit your licences and insurance once — verified by an admin, shown as ear-tag badges.",
-            "Get matched to properties nearest you that allow the species you hunt.",
-            "Set your own availability — daily, specific days, or every N days.",
-            "Request bookings and message farmers about access details.",
-            "Log harvest declarations and build a public rating from farmer reviews.",
-            "Stay across news and regional updates relevant to hunters.",
-          ]}
-        />
+      {/* HOW IT WORKS */}
+      <div id="how-it-works" style={{ maxWidth: 1180, margin: "0 auto", padding: "10px 20px 44px" }}>
+        <div style={{ textAlign: "center", marginBottom: 22 }}>
+          <div style={{ ...fontDisplay, fontSize: 24, fontWeight: 600, color: C.charcoal }}>How it works</div>
+        </div>
+        <div className="muster-two-col">
+          <PerspectiveList
+            title="For farmers"
+            Icon={Home}
+            accent={C.eucalyptDeep}
+            items={[
+              "List your property, define access rules, no-go zones and permitted hunting hours.",
+              "Choose which species you'll allow — deer, fox, rabbit, hare, wild dog, kangaroo and wombat, with ATCW permits tracked for you.",
+              "Browse hunters matched by distance, with verified credentials shown up front.",
+              "Approve or decline booking requests and message hunters directly.",
+              "See harvest declarations and leave a review after each visit.",
+              "Track regional pest pressure from sightings reported nearby.",
+            ]}
+          />
+          <PerspectiveList
+            title="For hunters"
+            Icon={UserCheck}
+            accent={C.goldDeep}
+            items={[
+              "Submit your licences and insurance once — verified by an admin, shown as ear-tag badges.",
+              "Get matched to properties nearest you that allow the species you hunt.",
+              "Set your own availability — daily, specific days, or every N days.",
+              "Request bookings and message farmers about access details.",
+              "Log harvest declarations and build a public rating from farmer reviews.",
+              "Stay across news and regional updates relevant to hunters.",
+            ]}
+          />
+        </div>
+      </div>
+
+      {/* ABOUT */}
+      <div
+        id="about"
+        style={{
+          background: C.paperDim,
+          borderTop: `1px solid ${C.line}`,
+          borderBottom: `1px solid ${C.line}`,
+        }}
+      >
+        <div style={{ maxWidth: 720, margin: "0 auto", padding: "44px 20px", textAlign: "center" }}>
+          <div style={{ ...fontDisplay, fontSize: 22, fontWeight: 600, color: C.charcoal, marginBottom: 12 }}>
+            About The Muster
+          </div>
+          <p style={{ ...fontBody, fontSize: 13.5, color: C.bark, lineHeight: 1.65, marginBottom: 22 }}>
+            Deer, fox and other pest pressure is a real cost to Victorian landholders, and licensed hunters
+            are ready to help — the two sides just don't have an easy way to find and trust each other. The
+            Muster verifies every hunter's credentials up front, puts access rules and no-go zones in the
+            farmer's control, and keeps every visit accountable with live tracking and SOS support.
+          </p>
+          <div style={{ display: "flex", gap: 10, justifyContent: "center", flexWrap: "wrap" }}>
+            <PrimaryButton icon={Home} onClick={goFarmerSignup}>List a property</PrimaryButton>
+            <GhostButton icon={UserCheck} onClick={goHunterSignup}>Become a hunter</GhostButton>
+          </div>
+        </div>
+      </div>
+
+      {/* FOOTER */}
+      <div style={{ padding: "24px 20px", textAlign: "center" }}>
+        <div style={{ ...fontMono, fontSize: 10.5, color: C.steel, letterSpacing: 0.4 }}>
+          THE MUSTER · VIC ACCREDITED VERMIN CONTROL · MOCKUP
+        </div>
       </div>
     </div>
   );
@@ -6929,6 +7227,21 @@ function AppShell() {
     return user.role === t.access;
   });
 
+  // The landing page gets the full marketing-site treatment (full-bleed
+  // hero, its own nav) rather than living inside the app's usual
+  // centered container/tab-bar chrome — everything else in the app
+  // keeps the original simple layout.
+  if (!user && screen === "landing") {
+    return (
+      <LandingHero
+        goLogin={() => setScreen("login")}
+        goFarmerSignup={() => setScreen("farmerSignup")}
+        goHunterSignup={() => setScreen("hunterSignup")}
+        goAdmin={() => setScreen("admin")}
+      />
+    );
+  }
+
   return (
     <div
       className="muster-page"
@@ -6939,7 +7252,7 @@ function AppShell() {
       }}
     >
       <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
+        ${GOOGLE_FONTS_IMPORT}
         * { box-sizing: border-box; }
 
         .muster-page {
@@ -7132,13 +7445,6 @@ function AppShell() {
             borderRadius: 16,
           }}
         >
-          {screen === "landing" && (
-            <LandingPage
-              goLogin={() => setScreen("login")}
-              goFarmerSignup={() => setScreen("farmerSignup")}
-              goHunterSignup={() => setScreen("hunterSignup")}
-            />
-          )}
           {screen === "login" && (
             <LoginScreen onLoggedIn={(role) => setScreen(role === "hunter" ? "hunterBookings" : "dashboard")} />
           )}

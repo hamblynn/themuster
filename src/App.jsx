@@ -3271,6 +3271,21 @@ function tagDivIcon(tagType) {
   });
 }
 
+// A rotated arrow instead of the default pin, so the marker shows which
+// way the phone (and presumably the hunter) is facing, not just where
+// they are.
+function headingDivIcon(headingDeg) {
+  return L.divIcon({
+    className: "",
+    html: `<svg width="30" height="30" viewBox="0 0 30 30" style="transform:rotate(${headingDeg}deg);transform-origin:15px 15px;">
+      <circle cx="15" cy="15" r="9" fill="${C.eucalyptDeep}" stroke="#fff" stroke-width="2"/>
+      <polygon points="15,2 20,13 15,10 10,13" fill="#fff"/>
+    </svg>`,
+    iconSize: [30, 30],
+    iconAnchor: [15, 15],
+  });
+}
+
 // Centers the map once, the first time a GPS fix arrives — doesn't fight
 // the hunter if they pan around afterward to look at where they've been.
 function RecenterOnce({ position }) {
@@ -3469,6 +3484,7 @@ function LiveTracker({ booking, initialSession, goBack }) {
   const [points, setPoints] = useState([]); // [[lat,lng], ...]
   const [tags, setTags] = useState([]);
   const [currentPos, setCurrentPos] = useState(null);
+  const [heading, setHeading] = useState(null); // compass degrees, 0 = north, clockwise
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState(null);
   const [noteDraft, setNoteDraft] = useState("");
@@ -3524,6 +3540,14 @@ function LiveTracker({ booking, initialSession, goBack }) {
         .then(setSession)
         .catch((e) => setError(e.message))
         .finally(() => setStarting(false));
+    }
+
+    // iOS 13+ gates DeviceOrientationEvent behind an explicit permission
+    // prompt that only works from a real user gesture — this button click
+    // is that gesture, so ask here rather than waiting for orientation
+    // data to silently never arrive.
+    if (typeof DeviceOrientationEvent !== "undefined" && typeof DeviceOrientationEvent.requestPermission === "function") {
+      DeviceOrientationEvent.requestPermission().catch(() => {});
     }
 
     if (booking?.geofence_required && navigator.geolocation) {
@@ -3610,6 +3634,27 @@ function LiveTracker({ booking, initialSession, goBack }) {
       wakeLockRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session?.id, session?.ended_at]);
+
+  // Compass heading while tracking is live, so the map marker can show
+  // which way the phone is facing rather than just where it is. iOS
+  // exposes a ready-made compass value (webkitCompassHeading); Android's
+  // "absolute" orientation event gives alpha counter-clockwise from
+  // north, so it needs inverting to match compass convention.
+  React.useEffect(() => {
+    if (!session || session.ended_at) return;
+    function handleOrientation(e) {
+      let deg = null;
+      if (typeof e.webkitCompassHeading === "number") {
+        deg = e.webkitCompassHeading;
+      } else if (e.absolute && typeof e.alpha === "number") {
+        deg = (360 - e.alpha) % 360;
+      }
+      if (deg != null) setHeading(deg);
+    }
+    const eventName = "ondeviceorientationabsolute" in window ? "deviceorientationabsolute" : "deviceorientation";
+    window.addEventListener(eventName, handleOrientation);
+    return () => window.removeEventListener(eventName, handleOrientation);
   }, [session?.id, session?.ended_at]);
 
   function toggleShare(next) {
@@ -3771,7 +3816,9 @@ function LiveTracker({ booking, initialSession, goBack }) {
       />
       <RecenterOnce position={currentPos} />
       {points.length > 1 && <Polyline positions={points} pathOptions={{ color: C.eucalyptDeep, weight: 3 }} />}
-      {currentPos && <Marker position={currentPos} />}
+      {currentPos && (
+        <Marker position={currentPos} icon={heading != null ? headingDivIcon(heading) : undefined} />
+      )}
       {tags.map((t) => (
         <Marker key={t.id} position={[t.latitude, t.longitude]} icon={tagDivIcon(t.tag_type)} />
       ))}

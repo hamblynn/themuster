@@ -3355,6 +3355,83 @@ function TrackKmlActions({ sessionId, emailLabel }) {
   );
 }
 
+// Lets a hunter reach GPS tracking from the tab bar directly, rather than
+// only via a "Start tracking" button on a specific approved booking — picks
+// from their approved bookings, then hands off into LiveTracker as normal.
+function GpsTrackingHub({ goLiveTracker }) {
+  const { user } = useAuth();
+  const [bookings, setBookings] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  React.useEffect(() => {
+    if (!user || user.role !== "hunter") {
+      setLoading(false);
+      return;
+    }
+    apiFetch("/bookings")
+      .then((r) => {
+        if (!r.ok) throw new Error("Could not load bookings");
+        return r.json();
+      })
+      .then((data) => {
+        setBookings(data.filter((b) => b.status === "approved"));
+        setError(null);
+      })
+      .catch((e) => setError(e.message))
+      .finally(() => setLoading(false));
+  }, [user?.role]);
+
+  if (!user || user.role !== "hunter") {
+    return (
+      <div style={{ padding: 24, ...fontBody, fontSize: 13.5, color: C.steel }}>
+        GPS tracking is available to logged-in hunters.
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ padding: "20px 18px 90px", display: "flex", flexDirection: "column", gap: 16 }}>
+      <div>
+        <div style={{ ...fontDisplay, fontSize: 22, color: C.charcoal }}>GPS tracking</div>
+        <div style={{ ...fontBody, fontSize: 13, color: C.steel, marginTop: 4 }}>
+          Pick an approved booking to start or continue live tracking.
+        </div>
+      </div>
+
+      {loading && <div style={{ ...fontBody, fontSize: 13, color: C.steel }}>Loading…</div>}
+      {error && <div style={{ ...fontBody, fontSize: 13, color: C.rust }}>{error}</div>}
+
+      {!loading && !error && bookings.length === 0 && (
+        <div style={{ ...fontBody, fontSize: 13, color: C.steel }}>
+          No approved bookings to track yet. Once a farmer approves a booking, it'll show up here.
+        </div>
+      )}
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        {bookings.map((b) => (
+          <div
+            key={b.id}
+            style={{ background: C.white, border: `1px solid ${C.line}`, borderRadius: 12, padding: 14 }}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+              <div>
+                <div style={{ ...fontBody, fontSize: 13, color: C.charcoal }}>
+                  {b.property_name} · {formatShortDate(b.requested_date)}
+                </div>
+                <div style={{ ...fontMono, fontSize: 10.5, color: C.steel }}>with {b.farmer_name}</div>
+              </div>
+              <GhostButton icon={Navigation} onClick={() => goLiveTracker(b)}>
+                {b.tracking_session && !b.tracking_session.ended_at ? "Continue tracking" : "Start tracking"}
+              </GhostButton>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function LiveTracker({ booking, goBack }) {
   const activeFromBooking =
     booking?.tracking_session && !booking.tracking_session.ended_at ? booking.tracking_session : null;
@@ -6524,6 +6601,7 @@ function AppShell() {
   const [selectedBookingParty, setSelectedBookingParty] = useState(null);
   const [messagesReturnScreen, setMessagesReturnScreen] = useState("booking");
   const [trackingBooking, setTrackingBooking] = useState(null);
+  const [liveTrackerReturnScreen, setLiveTrackerReturnScreen] = useState("hunterBookings");
   const [trackingViewSessionId, setTrackingViewSessionId] = useState(null);
   const [selectedPropertyId, setSelectedPropertyId] = useState(null);
   const [selectedPropertyName, setSelectedPropertyName] = useState(null);
@@ -6549,6 +6627,7 @@ function AppShell() {
 
   function openLiveTracker(booking) {
     setTrackingBooking(booking);
+    setLiveTrackerReturnScreen(screen);
     setScreen("liveTracker");
   }
 
@@ -6575,6 +6654,7 @@ function AppShell() {
     { id: "hunterBookings", label: "Booking requests", Icon: ClipboardList, accent: C.goldDeep, access: "hunter" },
     { id: "browseFarms", label: "Browse farms", Icon: MapPin, accent: C.goldDeep, access: "hunter" },
     { id: "hunterCredentials", label: "My credentials", Icon: ShieldCheck, accent: C.goldDeep, access: "hunter" },
+    { id: "gpsTracking", label: "GPS tracking", Icon: Navigation, accent: C.goldDeep, access: "hunter" },
     { id: "news", label: "News", Icon: Newspaper, accent: C.bark, access: "all" },
     { id: "messages", label: "Messages", Icon: MessageSquare, accent: C.bark, access: "all" },
     { id: "refer", label: "Refer a neighbour", Icon: UserPlus, accent: C.eucalyptDeep, access: "farmer" },
@@ -6837,8 +6917,9 @@ function AppShell() {
           {screen === "hunterBookings" && (
             <HunterBookings goMessages={openMessages} goLiveTracker={openLiveTracker} />
           )}
+          {screen === "gpsTracking" && <GpsTrackingHub goLiveTracker={openLiveTracker} />}
           {screen === "liveTracker" && (
-            <LiveTracker booking={trackingBooking} goBack={() => setScreen("hunterBookings")} />
+            <LiveTracker booking={trackingBooking} goBack={() => setScreen(liveTrackerReturnScreen)} />
           )}
           {screen === "browseFarms" && <BrowseFarms goFarm={openFarm} />}
           {screen === "farmProfile" && (

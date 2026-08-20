@@ -3361,6 +3361,7 @@ function TrackKmlActions({ sessionId, emailLabel }) {
 function GpsTrackingHub({ goLiveTracker }) {
   const { user } = useAuth();
   const [bookings, setBookings] = useState([]);
+  const [activeSession, setActiveSession] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
@@ -3369,18 +3370,26 @@ function GpsTrackingHub({ goLiveTracker }) {
       setLoading(false);
       return;
     }
-    apiFetch("/bookings")
-      .then((r) => {
+    Promise.all([
+      apiFetch("/bookings").then((r) => {
         if (!r.ok) throw new Error("Could not load bookings");
         return r.json();
-      })
-      .then((data) => {
-        setBookings(data.filter((b) => b.status === "approved"));
+      }),
+      apiFetch("/tracking/active").then((r) => (r.ok ? r.json() : null)),
+    ])
+      .then(([bookingsData, active]) => {
+        setBookings(bookingsData.filter((b) => b.status === "approved"));
+        setActiveSession(active);
         setError(null);
       })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
   }, [user?.role]);
+
+  // A personal (booking-less) active session — only relevant if it isn't
+  // already covered by one of the approved bookings above.
+  const personalActiveSession =
+    activeSession && !activeSession.booking_id && !activeSession.ended_at ? activeSession : null;
 
   if (!user || user.role !== "hunter") {
     return (
@@ -3401,6 +3410,25 @@ function GpsTrackingHub({ goLiveTracker }) {
 
       {loading && <div style={{ ...fontBody, fontSize: 13, color: C.steel }}>Loading…</div>}
       {error && <div style={{ ...fontBody, fontSize: 13, color: C.rust }}>{error}</div>}
+
+      {!loading && !error && (
+        <div style={{ background: C.white, border: `1px solid ${C.line}`, borderRadius: 12, padding: 14 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+            <div>
+              <div style={{ ...fontBody, fontSize: 13, color: C.charcoal }}>Personal track</div>
+              <div style={{ ...fontMono, fontSize: 10.5, color: C.steel }}>
+                Not tied to a booking — private to you, no farmer sharing.
+              </div>
+            </div>
+            <GhostButton
+              icon={Navigation}
+              onClick={() => goLiveTracker(null, personalActiveSession)}
+            >
+              {personalActiveSession ? "Continue tracking" : "Start tracking"}
+            </GhostButton>
+          </div>
+        </div>
+      )}
 
       {!loading && !error && bookings.length === 0 && (
         <div style={{ ...fontBody, fontSize: 13, color: C.steel }}>
@@ -3432,9 +3460,10 @@ function GpsTrackingHub({ goLiveTracker }) {
   );
 }
 
-function LiveTracker({ booking, goBack }) {
+function LiveTracker({ booking, initialSession, goBack }) {
   const activeFromBooking =
-    booking?.tracking_session && !booking.tracking_session.ended_at ? booking.tracking_session : null;
+    (booking?.tracking_session && !booking.tracking_session.ended_at ? booking.tracking_session : null) ||
+    (initialSession && !initialSession.ended_at ? initialSession : null);
 
   const [session, setSession] = useState(activeFromBooking);
   const [points, setPoints] = useState([]); // [[lat,lng], ...]
@@ -3486,7 +3515,8 @@ function LiveTracker({ booking, goBack }) {
       const body = position
         ? { latitude: position.coords.latitude, longitude: position.coords.longitude }
         : undefined;
-      apiFetch(`/bookings/${booking.id}/tracking/start`, { method: "POST", body })
+      const url = booking ? `/bookings/${booking.id}/tracking/start` : "/tracking/start";
+      apiFetch(url, { method: "POST", body: booking ? body : undefined })
         .then((r) => {
           if (!r.ok) return r.json().then((e) => Promise.reject(new Error(e.error)));
           return r.json();
@@ -3496,7 +3526,7 @@ function LiveTracker({ booking, goBack }) {
         .finally(() => setStarting(false));
     }
 
-    if (booking.geofence_required && navigator.geolocation) {
+    if (booking?.geofence_required && navigator.geolocation) {
       navigator.geolocation.getCurrentPosition(doStart, () => doStart(null), {
         enableHighAccuracy: true,
         timeout: 8000,
@@ -3636,7 +3666,7 @@ function LiveTracker({ booking, goBack }) {
         .catch(() => {});
     }
 
-    if (booking.geofence_required && navigator.geolocation) {
+    if (booking?.geofence_required && navigator.geolocation) {
       navigator.geolocation.getCurrentPosition(doStop, () => doStop(null), {
         enableHighAccuracy: true,
         timeout: 8000,
@@ -3709,10 +3739,6 @@ function LiveTracker({ booking, goBack }) {
 
   React.useEffect(() => cancelSosHold, []); // clear any pending timers on unmount
 
-  if (!booking) {
-    return <div style={{ ...fontBody, fontSize: 13, color: C.steel }}>No booking selected.</div>;
-  }
-
   const backLink = (
     <button
       onClick={goBack}
@@ -3760,12 +3786,17 @@ function LiveTracker({ booking, goBack }) {
       <div>
         <div style={{ marginBottom: 12 }}>{backLink}</div>
 
-        <div style={{ ...fontDisplay, fontSize: 20, color: C.charcoal }}>{booking.property_name}</div>
-        <div style={{ ...fontBody, fontSize: 12.5, color: C.steel, marginTop: 2, marginBottom: 12 }}>
-          Live tracker — private to you by default. Useful as a reference in the dark, whether or not you
-          choose to share it.
+        <div style={{ ...fontDisplay, fontSize: 20, color: C.charcoal }}>
+          {booking ? booking.property_name : "Personal track"}
         </div>
-        <GeofenceStatus booking={{ geofence_required: booking.geofence_required, tracking_session: session }} />
+        <div style={{ ...fontBody, fontSize: 12.5, color: C.steel, marginTop: 2, marginBottom: 12 }}>
+          {booking
+            ? "Live tracker — private to you by default. Useful as a reference in the dark, whether or not you choose to share it."
+            : "Live tracker — not tied to a booking, so it's private to you only and can't be shared with a farmer."}
+        </div>
+        {booking && (
+          <GeofenceStatus booking={{ geofence_required: booking.geofence_required, tracking_session: session }} />
+        )}
 
         {error && <div style={{ ...fontBody, fontSize: 12.5, color: C.rust, marginBottom: 10 }}>{error}</div>}
 
@@ -3815,10 +3846,14 @@ function LiveTracker({ booking, goBack }) {
         }}
       >
         {backLink}
-        <div style={{ ...fontDisplay, fontSize: 17, color: C.charcoal, marginTop: 4 }}>{booking.property_name}</div>
-        <div style={{ marginTop: 4 }}>
-          <GeofenceStatus booking={{ geofence_required: booking.geofence_required, tracking_session: session }} />
+        <div style={{ ...fontDisplay, fontSize: 17, color: C.charcoal, marginTop: 4 }}>
+          {booking ? booking.property_name : "Personal track"}
         </div>
+        {booking && (
+          <div style={{ marginTop: 4 }}>
+            <GeofenceStatus booking={{ geofence_required: booking.geofence_required, tracking_session: session }} />
+          </div>
+        )}
         {queueSize > 0 && (
           <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 6 }}>
             <RefreshCw size={12} color={C.gold} />
@@ -3847,11 +3882,13 @@ function LiveTracker({ booking, goBack }) {
           padding: "14px 16px calc(14px + env(safe-area-inset-bottom))",
         }}
       >
-        <Checkbox
-          label="Share live location with farmer"
-          checked={!!session.share_with_farmer}
-          onChange={toggleShare}
-        />
+        {booking && (
+          <Checkbox
+            label="Share live location with farmer"
+            checked={!!session.share_with_farmer}
+            onChange={toggleShare}
+          />
+        )}
 
         <div style={{ marginTop: 10 }}>
           <TextField
@@ -6601,6 +6638,7 @@ function AppShell() {
   const [selectedBookingParty, setSelectedBookingParty] = useState(null);
   const [messagesReturnScreen, setMessagesReturnScreen] = useState("booking");
   const [trackingBooking, setTrackingBooking] = useState(null);
+  const [trackingInitialSession, setTrackingInitialSession] = useState(null);
   const [liveTrackerReturnScreen, setLiveTrackerReturnScreen] = useState("hunterBookings");
   const [trackingViewSessionId, setTrackingViewSessionId] = useState(null);
   const [selectedPropertyId, setSelectedPropertyId] = useState(null);
@@ -6625,8 +6663,9 @@ function AppShell() {
     setScreen("messages");
   }
 
-  function openLiveTracker(booking) {
+  function openLiveTracker(booking, initialSession = null) {
     setTrackingBooking(booking);
+    setTrackingInitialSession(initialSession);
     setLiveTrackerReturnScreen(screen);
     setScreen("liveTracker");
   }
@@ -6919,7 +6958,11 @@ function AppShell() {
           )}
           {screen === "gpsTracking" && <GpsTrackingHub goLiveTracker={openLiveTracker} />}
           {screen === "liveTracker" && (
-            <LiveTracker booking={trackingBooking} goBack={() => setScreen(liveTrackerReturnScreen)} />
+            <LiveTracker
+              booking={trackingBooking}
+              initialSession={trackingInitialSession}
+              goBack={() => setScreen(liveTrackerReturnScreen)}
+            />
           )}
           {screen === "browseFarms" && <BrowseFarms goFarm={openFarm} />}
           {screen === "farmProfile" && (

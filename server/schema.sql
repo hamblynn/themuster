@@ -362,7 +362,9 @@ CREATE INDEX idx_sighting_dispatches_hunter ON sighting_dispatches(hunter_id);
 -- ------------------------------------------------------------
 CREATE TABLE tracking_sessions (
   id                INTEGER PRIMARY KEY AUTOINCREMENT,
-  booking_id        INTEGER NOT NULL REFERENCES bookings(id) ON DELETE CASCADE,
+  -- NULL for a personal track started outside of any booking (no
+  -- farmer to share with, no geofence to check against).
+  booking_id        INTEGER REFERENCES bookings(id) ON DELETE CASCADE,
   hunter_id         INTEGER NOT NULL REFERENCES hunters(id) ON DELETE CASCADE,
   started_at        TEXT NOT NULL DEFAULT (datetime('now')),
   ended_at          TEXT,                          -- NULL while active

@@ -1881,6 +1881,34 @@ app.post("/api/bookings/:id/tracking/start", requireAuth("hunter"), (req, res) =
   }
 });
 
+// POST /api/tracking/start — hunter only, no booking required. A personal
+// track: no farmer sharing, no geofence check. Same one-active-session
+// limit as booking-tied tracking (shared unique index on hunter_id).
+app.post("/api/tracking/start", requireAuth("hunter"), (req, res) => {
+  try {
+    const result = db
+      .prepare(`INSERT INTO tracking_sessions (booking_id, hunter_id, checkin_in_geofence) VALUES (NULL, ?, NULL)`)
+      .run(req.user.id);
+    res.status(201).json(db.prepare(`SELECT * FROM tracking_sessions WHERE id = ?`).get(result.lastInsertRowid));
+  } catch (e) {
+    if (e.message.includes("UNIQUE")) {
+      return res.status(400).json({ error: "You already have an active tracking session" });
+    }
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// GET /api/tracking/active — hunter only. Their current in-progress
+// session (booking-tied or personal), or null — lets the GPS tracking
+// tab offer "Continue" instead of losing track of a live personal
+// session when the hunter navigates away and back.
+app.get("/api/tracking/active", requireAuth("hunter"), (req, res) => {
+  const session = db
+    .prepare(`SELECT * FROM tracking_sessions WHERE hunter_id = ? AND ended_at IS NULL`)
+    .get(req.user.id);
+  res.json(session || null);
+});
+
 // PATCH /api/tracking/:sessionId — owner hunter only. body: { stop: true,
 // latitude?, longitude? } to end the session (server sets ended_at,
 // never trusts a client value for the timestamp itself — the position
@@ -1895,9 +1923,11 @@ app.patch("/api/tracking/:sessionId", requireAuth("hunter"), (req, res) => {
     return res.status(400).json({ error: "This tracking session has already ended" });
   }
   if (req.body.stop) {
-    const booking = db.prepare(`SELECT * FROM bookings WHERE id = ?`).get(session.booking_id);
+    const booking = session.booking_id
+      ? db.prepare(`SELECT * FROM bookings WHERE id = ?`).get(session.booking_id)
+      : null;
     let checkoutInGeofence = null;
-    if (booking.geofence_required) {
+    if (booking?.geofence_required) {
       const property = db
         .prepare(`SELECT latitude, longitude, geofence_radius_m FROM properties WHERE id = ?`)
         .get(booking.property_id);
@@ -1907,6 +1937,9 @@ app.patch("/api/tracking/:sessionId", requireAuth("hunter"), (req, res) => {
       .run(checkoutInGeofence, session.id);
   }
   if (req.body.share_with_farmer !== undefined) {
+    if (req.body.share_with_farmer && !session.booking_id) {
+      return res.status(400).json({ error: "A personal track has no booking, so there's no farmer to share it with" });
+    }
     db.prepare(`UPDATE tracking_sessions SET share_with_farmer = ? WHERE id = ?`).run(
       req.body.share_with_farmer ? 1 : 0,
       session.id
@@ -2016,13 +2049,15 @@ ${tagPlacemarks}
 app.get("/api/tracking/:sessionId", requireAuth(), (req, res) => {
   const session = db.prepare(`SELECT * FROM tracking_sessions WHERE id = ?`).get(req.params.sessionId);
   if (!session) return res.status(404).json({ error: "Tracking session not found" });
-  const booking = db.prepare(`SELECT * FROM bookings WHERE id = ?`).get(session.booking_id);
+  const booking = session.booking_id
+    ? db.prepare(`SELECT * FROM bookings WHERE id = ?`).get(session.booking_id)
+    : null;
 
   if (!canAccessTrackingSession(req, session, booking)) {
     return res.status(403).json({ error: "You don't have access to this tracking session" });
   }
 
-  session.geofence_required = booking.geofence_required;
+  session.geofence_required = booking ? booking.geofence_required : 0;
   session.hunter_name = db.prepare(`SELECT name FROM hunters WHERE id = ?`).get(session.hunter_id)?.name;
   session.points = db.prepare(`SELECT * FROM track_points WHERE session_id = ? ORDER BY recorded_at`).all(session.id);
   session.tags = db.prepare(`SELECT * FROM track_tags WHERE session_id = ? ORDER BY recorded_at`).all(session.id);
@@ -2035,7 +2070,9 @@ app.get("/api/tracking/:sessionId", requireAuth(), (req, res) => {
 app.get("/api/tracking/:sessionId/kml", requireAuth(), (req, res) => {
   const session = db.prepare(`SELECT * FROM tracking_sessions WHERE id = ?`).get(req.params.sessionId);
   if (!session) return res.status(404).json({ error: "Tracking session not found" });
-  const booking = db.prepare(`SELECT * FROM bookings WHERE id = ?`).get(session.booking_id);
+  const booking = session.booking_id
+    ? db.prepare(`SELECT * FROM bookings WHERE id = ?`).get(session.booking_id)
+    : null;
   if (!canAccessTrackingSession(req, session, booking)) {
     return res.status(403).json({ error: "You don't have access to this tracking session" });
   }
@@ -2059,7 +2096,9 @@ app.get("/api/tracking/:sessionId/kml", requireAuth(), (req, res) => {
 app.post("/api/tracking/:sessionId/kml/email", requireAuth(), async (req, res) => {
   const session = db.prepare(`SELECT * FROM tracking_sessions WHERE id = ?`).get(req.params.sessionId);
   if (!session) return res.status(404).json({ error: "Tracking session not found" });
-  const booking = db.prepare(`SELECT * FROM bookings WHERE id = ?`).get(session.booking_id);
+  const booking = session.booking_id
+    ? db.prepare(`SELECT * FROM bookings WHERE id = ?`).get(session.booking_id)
+    : null;
   if (!canAccessTrackingSession(req, session, booking)) {
     return res.status(403).json({ error: "You don't have access to this tracking session" });
   }
@@ -2101,14 +2140,18 @@ app.post("/api/tracking/:sessionId/sos", requireAuth("hunter"), (req, res) => {
   const alert = db.prepare(`SELECT * FROM sos_alerts WHERE id = ?`).get(result.lastInsertRowid);
 
   const hunter = db.prepare(`SELECT name FROM hunters WHERE id = ?`).get(req.user.id);
-  const booking = db.prepare(`SELECT * FROM bookings WHERE id = ?`).get(session.booking_id);
-  const property = db.prepare(`SELECT * FROM properties WHERE id = ?`).get(booking.property_id);
+  const booking = session.booking_id
+    ? db.prepare(`SELECT * FROM bookings WHERE id = ?`).get(session.booking_id)
+    : null;
+  const property = booking && db.prepare(`SELECT * FROM properties WHERE id = ?`).get(booking.property_id);
 
   const payload = { type: "sos", session_id: session.id, sos_id: alert.id, hunter_name: hunter.name, lat: latitude, lng: longitude };
 
-  db.prepare(`SELECT * FROM push_subscriptions WHERE owner_role = 'farmer' AND owner_id = ?`)
-    .all(property.farmer_id)
-    .forEach((sub) => sendPush(sub, payload));
+  if (property) {
+    db.prepare(`SELECT * FROM push_subscriptions WHERE owner_role = 'farmer' AND owner_id = ?`)
+      .all(property.farmer_id)
+      .forEach((sub) => sendPush(sub, payload));
+  }
 
   const activeHunterLatestPoints = db
     .prepare(`

@@ -1,3 +1,4 @@
+DROP TABLE IF EXISTS password_reset_tokens;
 DROP TABLE IF EXISTS push_subscriptions;
 DROP TABLE IF EXISTS sos_alerts;
 DROP TABLE IF EXISTS track_tags;

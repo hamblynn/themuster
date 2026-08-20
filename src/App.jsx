@@ -6385,6 +6385,63 @@ function LoginScreen({ onLoggedIn }) {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState(null);
 
+  // 'login' (default), 'forgot' (request a reset link), or 'reset'
+  // (landed here from the emailed link, with a token in the URL).
+  const [mode, setMode] = useState("login");
+  const [resetToken, setResetToken] = useState(null);
+  const [forgotEmail, setForgotEmail] = useState("");
+  const [forgotSent, setForgotSent] = useState(false);
+  const [resetPassword1, setResetPassword1] = useState("");
+  const [resetPassword2, setResetPassword2] = useState("");
+  const [resetDone, setResetDone] = useState(false);
+
+  // A reset link looks like /?resetToken=...&role=farmer|hunter — jump
+  // straight into the reset form and drop the token from the visible
+  // URL so it isn't left sitting in browser history/referrer headers.
+  React.useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const token = params.get("resetToken");
+    if (!token) return;
+    setResetToken(token);
+    setRole(params.get("role") === "hunter" ? "hunter" : "farmer");
+    setMode("reset");
+    window.history.replaceState({}, "", window.location.pathname);
+  }, []);
+
+  function submitForgot() {
+    setSubmitting(true);
+    setError(null);
+    apiFetch(`/auth/${role}/forgot-password`, { method: "POST", body: { email: forgotEmail } })
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Something went wrong — try again."))))
+      .then(() => setForgotSent(true))
+      .catch((e) => setError(e.message))
+      .finally(() => setSubmitting(false));
+  }
+
+  function submitReset() {
+    if (resetPassword1 !== resetPassword2) {
+      setError("Passwords don't match.");
+      return;
+    }
+    if (resetPassword1.length < 8) {
+      setError("Password must be at least 8 characters.");
+      return;
+    }
+    setSubmitting(true);
+    setError(null);
+    apiFetch(`/auth/${role}/reset-password`, {
+      method: "POST",
+      body: { token: resetToken, password: resetPassword1 },
+    })
+      .then((r) => {
+        if (!r.ok) return r.json().then((e) => Promise.reject(new Error(e.error)));
+        return r.json();
+      })
+      .then(() => setResetDone(true))
+      .catch((e) => setError(e.message))
+      .finally(() => setSubmitting(false));
+  }
+
   function submit() {
     if (!email || !password) {
       setError("Email and password are required.");
@@ -6624,6 +6681,134 @@ function LoginScreen({ onLoggedIn }) {
     );
   }
 
+  const linkButtonStyle = {
+    background: "none",
+    border: "none",
+    padding: 0,
+    cursor: "pointer",
+    ...fontMono,
+    fontSize: 11.5,
+    color: C.eucalyptDeep,
+    textDecoration: "underline",
+  };
+  const roleToggle = (
+    <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
+      {["farmer", "hunter"].map((r) => (
+        <div
+          key={r}
+          onClick={() => setRole(r)}
+          style={{
+            flex: 1,
+            textAlign: "center",
+            padding: "9px 0",
+            borderRadius: 8,
+            cursor: "pointer",
+            border: `1.5px solid ${role === r ? C.eucalyptDeep : C.line}`,
+            background: role === r ? C.mist : "transparent",
+            ...fontMono,
+            fontSize: 11.5,
+            color: C.charcoal,
+            textTransform: "uppercase",
+          }}
+        >
+          {r}
+        </div>
+      ))}
+    </div>
+  );
+
+  if (mode === "reset") {
+    return (
+      <div>
+        <div style={{ ...fontDisplay, fontSize: 22, color: C.charcoal }}>Set a new password</div>
+        {resetDone ? (
+          <>
+            <div style={{ ...fontBody, fontSize: 13, color: C.steel, marginTop: 2, marginBottom: 14 }}>
+              Your password's been updated — log in with it below.
+            </div>
+            <PrimaryButton
+              full
+              onClick={() => {
+                setMode("login");
+                setResetDone(false);
+                setError(null);
+              }}
+            >
+              Back to log in
+            </PrimaryButton>
+          </>
+        ) : (
+          <>
+            <div style={{ ...fontBody, fontSize: 13, color: C.steel, marginTop: 2 }}>
+              Choose a new password for your {role} account.
+            </div>
+            <Divider />
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              <TextField
+                label="NEW PASSWORD"
+                value={resetPassword1}
+                onChange={setResetPassword1}
+                placeholder="At least 8 characters"
+                type="password"
+              />
+              <TextField
+                label="CONFIRM PASSWORD"
+                value={resetPassword2}
+                onChange={setResetPassword2}
+                placeholder="At least 8 characters"
+                type="password"
+              />
+            </div>
+            {error && <div style={{ ...fontBody, fontSize: 12.5, color: C.rust, marginTop: 10 }}>{error}</div>}
+            <Divider />
+            <PrimaryButton full onClick={submitReset}>
+              {submitting ? "Saving…" : "Set new password"}
+            </PrimaryButton>
+          </>
+        )}
+      </div>
+    );
+  }
+
+  if (mode === "forgot") {
+    return (
+      <div>
+        <div style={{ ...fontDisplay, fontSize: 22, color: C.charcoal }}>Reset your password</div>
+        {forgotSent ? (
+          <div style={{ ...fontBody, fontSize: 13, color: C.steel, marginTop: 2 }}>
+            If that email's on file, a reset link is on its way — it expires in 45 minutes.
+          </div>
+        ) : (
+          <>
+            <div style={{ ...fontBody, fontSize: 13, color: C.steel, marginTop: 2 }}>
+              We'll email a link to reset your {role} account's password.
+            </div>
+            <Divider />
+            {roleToggle}
+            <TextField label="EMAIL" value={forgotEmail} onChange={setForgotEmail} placeholder="you@example.com" />
+            {error && <div style={{ ...fontBody, fontSize: 12.5, color: C.rust, marginTop: 10 }}>{error}</div>}
+            <Divider />
+            <PrimaryButton full onClick={submitForgot}>
+              {submitting ? "Sending…" : "Send reset link"}
+            </PrimaryButton>
+          </>
+        )}
+        <div style={{ marginTop: 14, textAlign: "center" }}>
+          <button
+            style={linkButtonStyle}
+            onClick={() => {
+              setMode("login");
+              setForgotSent(false);
+              setError(null);
+            }}
+          >
+            Back to log in
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div>
       <div style={{ ...fontDisplay, fontSize: 22, color: C.charcoal }}>Log in</div>
@@ -6634,29 +6819,7 @@ function LoginScreen({ onLoggedIn }) {
 
       <Divider />
 
-      <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
-        {["farmer", "hunter"].map((r) => (
-          <div
-            key={r}
-            onClick={() => setRole(r)}
-            style={{
-              flex: 1,
-              textAlign: "center",
-              padding: "9px 0",
-              borderRadius: 8,
-              cursor: "pointer",
-              border: `1.5px solid ${role === r ? C.eucalyptDeep : C.line}`,
-              background: role === r ? C.mist : "transparent",
-              ...fontMono,
-              fontSize: 11.5,
-              color: C.charcoal,
-              textTransform: "uppercase",
-            }}
-          >
-            {r}
-          </div>
-        ))}
-      </div>
+      {roleToggle}
 
       <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
         <TextField label="EMAIL" value={email} onChange={setEmail} placeholder="you@example.com" />
@@ -6669,6 +6832,11 @@ function LoginScreen({ onLoggedIn }) {
       <PrimaryButton full onClick={submit}>
         {submitting ? "Logging in…" : `Log in as ${role}`}
       </PrimaryButton>
+      <div style={{ marginTop: 12, textAlign: "center" }}>
+        <button style={linkButtonStyle} onClick={() => setMode("forgot")}>
+          Forgot password?
+        </button>
+      </div>
     </div>
   );
 }
@@ -6678,7 +6846,13 @@ function LoginScreen({ onLoggedIn }) {
 --------------------------------------------------------- */
 function AppShell() {
   const { user, logout } = useAuth();
-  const [screen, setScreen] = useState(user ? "dashboard" : "landing");
+  // A password-reset email link lands on "/?resetToken=...&role=..." —
+  // jump straight to the login tab (LoginScreen itself reads the token
+  // and shows the reset form) instead of the usual landing page.
+  const [screen, setScreen] = useState(() => {
+    if (typeof window !== "undefined" && window.location.search.includes("resetToken=")) return "login";
+    return user ? "dashboard" : "landing";
+  });
   const [selectedHunterId, setSelectedHunterId] = useState(null);
   const [selectedHunterName, setSelectedHunterName] = useState(null);
   const [selectedBookingId, setSelectedBookingId] = useState(null);

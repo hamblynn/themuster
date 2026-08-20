@@ -5,6 +5,7 @@ const rateLimit = require("express-rate-limit");
 const Database = require("better-sqlite3");
 const path = require("path");
 const fs = require("fs");
+const crypto = require("crypto");
 const webPush = require("web-push");
 const { Resend } = require("resend");
 const {
@@ -98,6 +99,7 @@ function makeLoginLimiter(max) {
 const loginLimiter = makeLoginLimiter(10); // farmer/hunter login
 const adminLoginLimiter = makeLoginLimiter(5); // stricter — higher blast radius if compromised
 const registerLimiter = makeLoginLimiter(10); // deter signup spam, same window
+const resetLimiter = makeLoginLimiter(5); // forgot-password — same idea, stops inbox-spamming an email
 
 // ---------------------------------------------------------
 // Helpers
@@ -329,6 +331,71 @@ app.post("/api/auth/hunter/login", loginLimiter, (req, res) => {
   }
   setSessionCookie(res, { id: hunter.id, role: "hunter" });
   res.json({ user: { ...omitPassword(hunter), role: "hunter" } });
+});
+
+// ===========================================================
+// AUTH — password reset (farmer/hunter only, not admin)
+// ===========================================================
+const RESET_TOKEN_TABLE_BY_ROLE = { farmer: "farmers", hunter: "hunters" };
+const RESET_TOKEN_TTL_MS = 45 * 60 * 1000;
+
+function hashResetToken(token) {
+  return crypto.createHash("sha256").update(token).digest("hex");
+}
+
+// POST /api/auth/:role/forgot-password — body: { email }. Always
+// returns { ok: true } whether or not the email matches an account,
+// so this can't be used to enumerate registered emails. If it does
+// match, emails a reset link — token itself is never stored, only
+// its hash, so a DB read alone can't reset someone's password.
+app.post("/api/auth/:role/forgot-password", resetLimiter, async (req, res) => {
+  const table = RESET_TOKEN_TABLE_BY_ROLE[req.params.role];
+  if (!table) return res.status(404).json({ error: "Not found" });
+
+  const { email } = req.body;
+  const account = email && db.prepare(`SELECT id, name FROM ${table} WHERE email = ?`).get(email);
+
+  if (account) {
+    const token = crypto.randomBytes(32).toString("hex");
+    const expiresAt = new Date(Date.now() + RESET_TOKEN_TTL_MS).toISOString();
+    db.prepare(
+      `INSERT INTO password_reset_tokens (owner_role, owner_id, token_hash, expires_at) VALUES (?, ?, ?, ?)`
+    ).run(req.params.role, account.id, hashResetToken(token), expiresAt);
+
+    const resetUrl = `${CLIENT_ORIGIN}/?resetToken=${token}&role=${req.params.role}`;
+    await sendEmail(
+      "Reset your Muster password",
+      `<p>Hi ${escapeXml(account.name)},</p>
+       <p>Someone (hopefully you) asked to reset your Muster password. This link expires in 45 minutes:</p>
+       <p><a href="${resetUrl}">${resetUrl}</a></p>
+       <p>If you didn't request this, you can ignore this email.</p>`
+    );
+  }
+
+  res.json({ ok: true });
+});
+
+// POST /api/auth/:role/reset-password — body: { token, password }.
+app.post("/api/auth/:role/reset-password", resetLimiter, (req, res) => {
+  const table = RESET_TOKEN_TABLE_BY_ROLE[req.params.role];
+  if (!table) return res.status(404).json({ error: "Not found" });
+
+  const { token, password } = req.body;
+  if (!token || !password) return res.status(400).json({ error: "token and password are required" });
+  if (password.length < 8) return res.status(400).json({ error: "Password must be at least 8 characters" });
+
+  const row = db
+    .prepare(
+      `SELECT * FROM password_reset_tokens
+       WHERE token_hash = ? AND owner_role = ? AND used_at IS NULL AND expires_at > datetime('now')`
+    )
+    .get(hashResetToken(token), req.params.role);
+  if (!row) return res.status(400).json({ error: "This reset link is invalid or has expired" });
+
+  db.prepare(`UPDATE ${table} SET password_hash = ? WHERE id = ?`).run(hashPassword(password), row.owner_id);
+  db.prepare(`UPDATE password_reset_tokens SET used_at = datetime('now') WHERE id = ?`).run(row.id);
+
+  res.json({ ok: true });
 });
 
 // POST /api/auth/logout — clears the main session cookie (farmer/hunter)

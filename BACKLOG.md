@@ -11,13 +11,18 @@ through or remove once shipped (check the commit that closes it).
   higher blast radius), and both register routes (10/15min, anti-spam).
   Throttle only, no persistent lockout — resets automatically. Needed
   `app.set("trust proxy", 1)` since Render sits in front as a proxy.
-- **Forgot-password flow** — scoped, not built. Token-based reset,
-  farmer/hunter only (skip admin). New `password_reset_tokens` table
-  (hashed token, expiry, single-use). Needs new URL-param handling in
-  `App.jsx` (currently has none) to open a reset screen from an email
-  link. **Blocked on the email test-stub below** — until that's fixed,
-  reset links for any account would land in your inbox, not the actual
-  user's, so sequence that first or accept it's you-only for now.
+- ~~**Forgot-password flow**~~ — done. Token-based reset, farmer/hunter
+  only (admin skipped, single fixed demo account). New
+  `password_reset_tokens` table (hashed token, 45min expiry,
+  single-use). "Forgot password?" link on the login screen; reset link
+  opens `/?resetToken=...&role=...`, which `LoginScreen` picks up via
+  new URL-param handling in `App.jsx` and immediately clears from the
+  visible URL. Verified end-to-end locally (request → token → reset →
+  login with new password → old token rejected on reuse). **Still
+  inherits the email test-stub below** — reset links go out via the
+  same `sendEmail()` that redirects everything to
+  `TEST_SITE_EMAIL_OVERRIDE`, so today a reset link for any account
+  lands in your inbox, not the actual user's, until that's fixed.
 - **Real `JWT_SECRET` in production** — currently falls back to a
   hardcoded dev value in `auth.js`. Needs a real secret from env before
   any non-mockup deployment.

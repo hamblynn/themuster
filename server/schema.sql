@@ -22,6 +22,24 @@ CREATE TABLE admins (
 );
 
 -- ------------------------------------------------------------
+-- PASSWORD RESET TOKENS
+-- Farmer/hunter only (not admin — a single fixed demo account isn't
+-- worth building reset for). Stores a hash of the token, never the raw
+-- value, so a DB read alone can't be used to reset someone's password.
+-- Single-use (used_at) and short-lived (expires_at).
+-- ------------------------------------------------------------
+CREATE TABLE password_reset_tokens (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  owner_role  TEXT NOT NULL CHECK (owner_role IN ('farmer', 'hunter')),
+  owner_id    INTEGER NOT NULL,
+  token_hash  TEXT NOT NULL UNIQUE,
+  expires_at  TEXT NOT NULL,
+  used_at     TEXT,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX idx_password_reset_tokens_hash ON password_reset_tokens(token_hash);
+
+-- ------------------------------------------------------------
 -- NEWS
 -- Admin-posted announcements, tagged for farmers, hunters, or both.
 -- ------------------------------------------------------------

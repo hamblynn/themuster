@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const cookieParser = require("cookie-parser");
+const rateLimit = require("express-rate-limit");
 const Database = require("better-sqlite3");
 const path = require("path");
 const fs = require("fs");
@@ -66,6 +67,11 @@ db.pragma("foreign_keys = ON");
 db.pragma("journal_mode = WAL");
 
 const app = express();
+// Render sits in front of this app as a reverse proxy — without this,
+// express-rate-limit (and req.ip generally) would see every request as
+// coming from Render's proxy, not the real client, either merging every
+// visitor into one shared limit or refusing to start at all.
+app.set("trust proxy", 1);
 // credentials: true + an explicit origin (not "*") are both required for
 // the browser to accept the httpOnly session cookie cross-origin (the
 // Vite dev server on :5173 talking to the API on :4000).
@@ -73,6 +79,25 @@ const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "http://localhost:5173";
 app.use(cors({ origin: CLIENT_ORIGIN, credentials: true }));
 app.use(express.json());
 app.use(cookieParser());
+
+// ---------------------------------------------------------
+// Rate limiting — login/register endpoints only. Throttle, not lockout:
+// resets on its own after the window, no persistent "account locked"
+// state, so there's no new way to lock a real user out of their own
+// account by hammering their email from somewhere else.
+// ---------------------------------------------------------
+function makeLoginLimiter(max) {
+  return rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: "Too many attempts — please wait a few minutes and try again." },
+  });
+}
+const loginLimiter = makeLoginLimiter(10); // farmer/hunter login
+const adminLoginLimiter = makeLoginLimiter(5); // stricter — higher blast radius if compromised
+const registerLimiter = makeLoginLimiter(10); // deter signup spam, same window
 
 // ---------------------------------------------------------
 // Helpers
@@ -195,7 +220,7 @@ function omitPassword(row) {
 // ===========================================================
 
 // POST /api/auth/farmer/register — body: { name, email, phone, password }
-app.post("/api/auth/farmer/register", (req, res) => {
+app.post("/api/auth/farmer/register", registerLimiter, (req, res) => {
   const { name, email, phone, password } = req.body;
   if (!name || !email || !password) {
     return res.status(400).json({ error: "name, email and password are required" });
@@ -218,7 +243,7 @@ app.post("/api/auth/farmer/register", (req, res) => {
 });
 
 // POST /api/auth/farmer/login — body: { email, password }
-app.post("/api/auth/farmer/login", (req, res) => {
+app.post("/api/auth/farmer/login", loginLimiter, (req, res) => {
   const { email, password } = req.body;
   const farmer = db.prepare(`SELECT * FROM farmers WHERE email = ?`).get(email);
   if (!farmer || !verifyPassword(password || "", farmer.password_hash)) {
@@ -237,7 +262,7 @@ app.post("/api/auth/farmer/login", (req, res) => {
 //         thermal_capable, suppressed_capable,
 //         credentials: [{ credential_type, reference_number, issuer, issued_date, expiry_date }] }
 // New hunters start inactive (is_active = 0) until an admin verifies credentials.
-app.post("/api/auth/hunter/register", (req, res) => {
+app.post("/api/auth/hunter/register", registerLimiter, (req, res) => {
   const {
     name, email, phone, password, bio, latitude, longitude,
     thermal_capable, suppressed_capable, credentials,
@@ -296,7 +321,7 @@ app.post("/api/auth/hunter/register", (req, res) => {
 });
 
 // POST /api/auth/hunter/login — body: { email, password }
-app.post("/api/auth/hunter/login", (req, res) => {
+app.post("/api/auth/hunter/login", loginLimiter, (req, res) => {
   const { email, password } = req.body;
   const hunter = db.prepare(`SELECT * FROM hunters WHERE email = ?`).get(email);
   if (!hunter || !verifyPassword(password || "", hunter.password_hash)) {
@@ -321,7 +346,7 @@ app.post("/api/auth/logout", (req, res) => {
 // ===========================================================
 
 // POST /api/auth/admin/login — body: { username, password }
-app.post("/api/auth/admin/login", (req, res) => {
+app.post("/api/auth/admin/login", adminLoginLimiter, (req, res) => {
   const { username, password } = req.body;
   const admin = db.prepare(`SELECT * FROM admins WHERE username = ?`).get(username);
   if (!admin || !verifyPassword(password || "", admin.password_hash)) {

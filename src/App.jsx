@@ -41,6 +41,10 @@ import {
 import { MapContainer, TileLayer, Marker, Polyline, useMap } from "react-leaflet";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
+// Landing-page hero background — compressed to WebP (~106KB, down from a
+// 2.1MB PNG source) at its native 1920px width; CSS background-size:cover
+// scales it to fill the hero at any viewport size.
+import heroBg from "./assets/hero-bg.webp";
 
 // Leaflet's default marker icon breaks under Vite/Rollup bundling unless
 // explicitly re-pointed at the bundled image URLs — a well-known gotcha,
@@ -1233,23 +1237,18 @@ function LandingHero({ goLogin, goFarmerSignup, goHunterSignup, goAdmin }) {
         style={{
           position: "relative",
           overflow: "hidden",
-          background: `linear-gradient(115deg, ${C.charcoal} 0%, #3B4A38 42%, #6E5A2E 78%, ${C.gold} 100%)`,
+          backgroundImage: `url(${heroBg})`,
+          backgroundSize: "cover",
+          backgroundPosition: "center 65%",
         }}
       >
-        {/* decorative rolling-hill silhouette — CSS/SVG only, no external image */}
-        <svg
-          viewBox="0 0 1200 300"
-          preserveAspectRatio="none"
-          style={{ position: "absolute", left: 0, right: 0, bottom: -2, width: "100%", height: "34%", opacity: 0.5 }}
-        >
-          <path d="M0,180 C200,120 340,220 560,150 C760,90 900,190 1200,110 L1200,300 L0,300 Z" fill="#232019" />
-          <path d="M0,230 C260,190 420,260 680,210 C880,175 1000,240 1200,200 L1200,300 L0,300 Z" fill="#171410" />
-        </svg>
+        {/* darkens the left/text side so white headline copy stays readable
+            over the photo without a full-frame tint that would flatten it */}
         <div
           style={{
             position: "absolute",
             inset: 0,
-            background: "linear-gradient(90deg, rgba(20,18,14,0.72) 0%, rgba(20,18,14,0.38) 55%, rgba(20,18,14,0.08) 100%)",
+            background: "linear-gradient(90deg, rgba(20,18,14,0.72) 0%, rgba(20,18,14,0.40) 50%, rgba(20,18,14,0.12) 100%)",
           }}
         />
 
